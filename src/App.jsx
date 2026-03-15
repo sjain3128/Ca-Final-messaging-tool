@@ -59,24 +59,37 @@ const fetchMessages = () => sbFetch("/messages?select=*&order=created_at.desc");
 const fetchThread   = (mid) => sbFetch(`/thread_messages?message_id=eq.${mid}&select=*&order=created_at.asc`);
 const insertMessage = (p) => sbFetch("/messages", { method: "POST", body: JSON.stringify(p) }).then(r => r[0]);
 const insertThread  = (p) => sbFetch("/thread_messages", { method: "POST", body: JSON.stringify(p) }).then(r => r[0]);
-const markReplied     = (id) => sbFetch(`/messages?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "Replied" }) });
-const deleteMessage   = (id) => sbFetch(`/messages?id=eq.${id}`, { method: "DELETE" });
-const deleteThread    = (mid) => sbFetch(`/thread_messages?message_id=eq.${mid}`, { method: "DELETE" });
-const editThreadMsg   = (id, text) => sbFetch(`/thread_messages?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ text, edited: true, edited_at: new Date().toISOString() }) });
+const markReplied   = (id) => sbFetch(`/messages?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "Replied" }) });
+const deleteMessage = (id) => sbFetch(`/messages?id=eq.${id}`, { method: "DELETE" });
+const deleteThread  = (mid) => sbFetch(`/thread_messages?message_id=eq.${mid}`, { method: "DELETE" });
+const editThreadMsg = (id, text) => sbFetch(`/thread_messages?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ text, edited: true, edited_at: new Date().toISOString() }) });
+
+// ── Email notification via Supabase Edge Function ─────────────────────────────
+async function sendNotification(payload) {
+  try {
+    await fetch(`${SUPABASE_URL}/functions/v1/notify`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    console.warn("Notification failed (non-critical):", e);
+  }
+}
 
 // Upsert student profile by mobile (returns existing or creates new)
-async function upsertStudentProfile(name, mobile) {
-  // Try find existing
+async function upsertStudentProfile(name, mobile, email) {
   const existing = await sbFetch(`/student_profiles?mobile=eq.${encodeURIComponent(mobile)}&select=*`);
   if (existing.length > 0) {
-    // Update name in case they changed it
     await sbFetch(`/student_profiles?mobile=eq.${encodeURIComponent(mobile)}`, {
-      method: "PATCH", body: JSON.stringify({ name }),
+      method: "PATCH", body: JSON.stringify({ name, email }),
     });
-    return existing[0];
+    return { ...existing[0], name, email };
   }
-  // Create new
-  const rows = await sbFetch("/student_profiles", { method: "POST", body: JSON.stringify({ name, mobile }) });
+  const rows = await sbFetch("/student_profiles", { method: "POST", body: JSON.stringify({ name, mobile, email }) });
   return rows[0];
 }
 
@@ -589,27 +602,31 @@ function ReplyBar({ replyTo, onCancel, allMsgs }) {
 function StudentLogin({ onLogin }) {
   const [name, setName]     = useState("");
   const [mobile, setMobile] = useState("");
+  const [email, setEmail]   = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError]   = useState("");
 
   const handleLogin = async () => {
     if (!name.trim()) { setError("Please enter your name."); return; }
     if (!/^[6-9]\d{9}$/.test(mobile.trim())) { setError("Please enter a valid 10-digit Indian mobile number."); return; }
+    if (!email.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) { setError("Please enter a valid email address."); return; }
     setError(""); setLoading(true);
     try {
-      const profile = await upsertStudentProfile(name.trim(), mobile.trim());
-      // Check if they have an existing conversation
+      const profile = await upsertStudentProfile(name.trim(), mobile.trim(), email.trim().toLowerCase());
       const existing = await findStudentConversation(profile.id);
       onLogin({
         profileId: profile.id,
         studentName: profile.name,
         mobile: profile.mobile,
+        email: email.trim().toLowerCase(),
         messageId: existing ? existing.id : null,
       });
     } catch (e) {
       setError("Login failed. Please try again.");
     } finally { setLoading(false); }
   };
+
+  const canLogin = name.trim() && mobile.length === 10 && email.includes("@");
 
   return (
     <div className="login-screen">
@@ -622,6 +639,15 @@ function StudentLogin({ onLogin }) {
           <label className="label">Your name</label>
           <input className="input" placeholder="e.g. Riya Sharma"
             value={name} onChange={e => setName(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter") handleLogin(); }} />
+        </div>
+
+        <div className="field" style={{ marginBottom: 14 }}>
+          <label className="label">
+            Email address <span style={{ fontWeight: 400, color: "var(--ink3)" }}>(for reply notifications)</span>
+          </label>
+          <input className="input" type="email" placeholder="e.g. riya@gmail.com"
+            value={email} onChange={e => setEmail(e.target.value)}
             onKeyDown={e => { if (e.key === "Enter") handleLogin(); }} />
         </div>
 
@@ -639,12 +665,12 @@ function StudentLogin({ onLogin }) {
         </div>
 
         <div className="login-disclaimer">
-          🔒 <strong>Privacy notice:</strong> Your mobile number is used <em>only</em> to notify you when your mentor replies. It is never shared, sold, or stored for any other purpose. You can delete your account at any time by contacting the mentor.
+          🔒 <strong>Privacy notice:</strong> Your email and mobile number are used <em>only</em> to notify you when your mentor replies. They are never shared, sold, or used for any other purpose. You can delete your account at any time by contacting the mentor.
         </div>
 
         {error && <div className="error-text mt-8">{error}</div>}
 
-        <button className="login-btn" onClick={handleLogin} disabled={loading || !name.trim() || mobile.length < 10}>
+        <button className="login-btn" onClick={handleLogin} disabled={loading || !canLogin}>
           {loading ? "Signing in…" : "Continue to chat →"}
         </button>
       </div>
@@ -665,7 +691,7 @@ function StudentPortal({ onToast }) {
   });
 
   const handleLogin = (loginData) => {
-    const p = { profileId: loginData.profileId, studentName: loginData.studentName, mobile: loginData.mobile };
+    const p = { profileId: loginData.profileId, studentName: loginData.studentName, mobile: loginData.mobile, email: loginData.email };
     localStorage.setItem(STUDENT_PROFILE_KEY, JSON.stringify(p));
     setProfile(p);
     if (loginData.messageId) {
@@ -813,6 +839,12 @@ function StudentForm({ profile, onToast, onSession, onLogout }) {
       });
 
       onToast("Message sent!", "success");
+      // Notify mentor by email
+      sendNotification({
+        type: "student_message",
+        studentName: profile.studentName,
+        messageText: hasText ? message.trim() : "(Voice/File message)",
+      });
       onSession({ messageId: row.id, studentName: profile.studentName });
     } catch (err) {
       console.error(err);
@@ -1042,6 +1074,14 @@ function StudentChat({ session, profile, onToast, onEnd, onLogout }) {
       });
       setThread(p => [...p, row]);
       setText(""); setStagedFile(null); setReplyTo(null); setNewReply(false);
+      // Notify mentor about follow-up message
+      if (hasText || stagedFile) {
+        sendNotification({
+          type: "student_message",
+          studentName: session.studentName,
+          messageText: hasText ? text.trim() : "(File/image attachment)",
+        });
+      }
       onToast(stagedFile ? (stagedFile.isPdf ? "PDF sent! ✅" : "File sent! ✅") : "", "success");
     } catch { onToast("Send failed. Try again.", "error"); }
     finally { setSending(false); }
@@ -1393,6 +1433,23 @@ function MentorInbox({ onToast }) {
       setMessages(p => p.map(m => m.id === activeId ? { ...m, status: "Replied" } : m));
       setReply(""); setStagedFile(null); setReplyTo(null);
       onToast("Sent! ✅", "success");
+
+      // Notify student by email — fetch their profile
+      try {
+        const msgRow = messages.find(m => m.id === activeId);
+        if (msgRow?.student_profile_id) {
+          const profiles = await sbFetch(`/student_profiles?id=eq.${msgRow.student_profile_id}&select=name,email`);
+          if (profiles[0]?.email) {
+            sendNotification({
+              type: "mentor_reply",
+              studentName: profiles[0].name,
+              studentEmail: profiles[0].email,
+              messageText: hasText ? reply.trim() : "(Voice/file attachment)",
+            });
+          }
+        }
+      } catch (e) { console.warn("Student notify lookup failed:", e); }
+
     } catch { onToast("Failed to send", "error"); }
     finally { setSending(false); }
   };
@@ -1435,6 +1492,16 @@ function MentorInbox({ onToast }) {
           setMessages(p => p.map(m => m.id === activeId ? { ...m, status: "Replied" } : m));
           setReplyTo(null);
           onToast("Voice reply sent!", "success");
+          // Notify student
+          try {
+            const msgRow = messages.find(m => m.id === activeId);
+            if (msgRow?.student_profile_id) {
+              const profiles = await sbFetch(`/student_profiles?id=eq.${msgRow.student_profile_id}&select=name,email`);
+              if (profiles[0]?.email) {
+                sendNotification({ type: "mentor_reply", studentName: profiles[0].name, studentEmail: profiles[0].email, messageText: "🎤 Voice note from your mentor" });
+              }
+            }
+          } catch {}
         } catch { onToast("Voice reply failed", "error"); }
         finally { setSending(false); }
       };
