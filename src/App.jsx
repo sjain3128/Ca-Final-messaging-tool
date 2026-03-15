@@ -219,7 +219,7 @@ const css = `
   .convo-time { font-size:11px; color:var(--ink3); white-space:nowrap; margin-left:auto; }
 
   /* chat thread */
-  .chat-thread { height:400px; overflow-y:auto; padding:16px; background:var(--surface2); display:flex; flex-direction:column; gap:12px; }
+  .chat-thread { height:400px; overflow-y:auto; padding:16px 40px; background:var(--surface2); display:flex; flex-direction:column; gap:12px; }
   .msg-row { display:flex; flex-direction:column; }
   .msg-row.mine { align-items:flex-end; }
   .msg-row.theirs { align-items:flex-start; }
@@ -240,7 +240,7 @@ const css = `
   /* student live chat */
   .student-chat { display:flex; flex-direction:column; height:calc(100vh - 300px); min-height:480px; background:var(--surface); border-radius:var(--radius); box-shadow:var(--shadow); overflow:hidden; }
   .student-chat-header { padding:16px 20px; background:#0f172a; color:white; display:flex; align-items:center; gap:12px; }
-  .student-chat-messages { flex:1; overflow-y:auto; padding:16px; background:var(--surface2); display:flex; flex-direction:column; gap:12px; }
+  .student-chat-messages { flex:1; overflow-y:auto; padding:16px 40px; background:var(--surface2); display:flex; flex-direction:column; gap:12px; }
 
   /* toast */
   .toast { position:fixed; bottom:24px; right:24px; padding:12px 20px; border-radius:var(--radius-sm); font-size:14px; font-weight:500; box-shadow:var(--shadow-lg); z-index:999; animation:slideup .3s ease; }
@@ -366,7 +366,7 @@ function MsgBubble({ msg, isMine, onReply, allMsgs }) {
     <div
       ref={rowRef}
       className={`msg-row ${isMine ? "mine" : "theirs"}`}
-      style={{ position: "relative" }}
+      style={{ position: "relative", paddingLeft: isMine ? 0 : 36, paddingRight: isMine ? 36 : 0 }}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       onTouchStart={onTouchStart}
@@ -375,28 +375,33 @@ function MsgBubble({ msg, isMine, onReply, allMsgs }) {
     >
       <div className="msg-sender">{isMine ? "You" : (msg.sender_label || "Student")}</div>
 
-      {/* Swipe reply icon — shown on swipe or hover */}
-      {(hovered || Math.abs(swipeX) > 5) && (
-        <button
-          onClick={() => onReply(msg)}
-          title="Reply to this message"
-          style={{
-            position: "absolute", top: "50%", transform: "translateY(-50%)",
-            [isMine ? "left" : "right"]: hovered ? -36 : Math.abs(swipeX) > 5 ? 4 : -36,
-            background: "var(--surface3)", border: "1.5px solid var(--border)",
-            borderRadius: "50%", width: 28, height: 28,
-            display: "flex", alignItems: "center", justifyContent: "center",
-            cursor: "pointer", color: "var(--accent2)", transition: "opacity .15s",
-            zIndex: 2,
-          }}>
-          <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor"
-            strokeWidth={2.2} strokeLinecap="round" strokeLinejoin="round">
-            <path d="M9 17H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11a2 2 0 0 1 2 2v3" />
-            <path d="M13 21l-4-4 4-4" />
-            <path d="M9 17h8a2 2 0 0 0 2-2v-3" />
-          </svg>
-        </button>
-      )}
+      {/* Reply button — left side for "theirs", right side for "mine" */}
+      <button
+        onClick={() => onReply(msg)}
+        title="Reply to this message"
+        style={{
+          position: "absolute",
+          top: "50%",
+          transform: "translateY(-50%)",
+          ...(isMine ? { right: 0 } : { left: 0 }),
+          background: hovered ? "var(--surface3)" : "transparent",
+          border: hovered ? "1.5px solid var(--border)" : "1.5px solid transparent",
+          borderRadius: "50%",
+          width: 28, height: 28,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          cursor: "pointer",
+          color: hovered ? "var(--accent2)" : "transparent",
+          transition: "all .15s",
+          zIndex: 2,
+          flexShrink: 0,
+        }}>
+        <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          strokeWidth={2.2} strokeLinecap="round" strokeLinejoin="round">
+          <path d="M9 17H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11a2 2 0 0 1 2 2v3" />
+          <path d="M13 21l-4-4 4-4" />
+          <path d="M9 17h8a2 2 0 0 0 2-2v-3" />
+        </svg>
+      </button>
 
       <div
         className={`bubble ${isMine ? "bubble-you" : "bubble-student"}`}
@@ -707,11 +712,12 @@ function StudentForm({ onToast, onSession }) {
 
 // ── FIX #4 — STUDENT LIVE CHAT (continues after first message) ───────────────
 function StudentChat({ session, onToast, onEnd }) {
-  const [thread, setThread]   = useState([]);
-  const [text, setText]       = useState("");
-  const [sending, setSending] = useState(false);
-  const [isRec, setIsRec]     = useState(false);
-  const [replyTo, setReplyTo] = useState(null); // quoted message
+  const [thread, setThread]     = useState([]);
+  const [text, setText]         = useState("");
+  const [sending, setSending]   = useState(false);
+  const [isRec, setIsRec]       = useState(false);
+  const [replyTo, setReplyTo]   = useState(null);
+  const [stagedFile, setStagedFile] = useState(null); // { file, previewUrl, isImg, isPdf, name }
   const recRef = useRef(null);
   const chunks = useRef([]);
   const fileRef = useRef(null);
@@ -722,30 +728,58 @@ function StudentChat({ session, onToast, onEnd }) {
   }, [session.messageId]);
 
   useEffect(() => { loadThread(); }, [loadThread]);
+  useEffect(() => { const id = setInterval(loadThread, 5000); return () => clearInterval(id); }, [loadThread]);
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [thread]);
 
-  // Auto-poll every 5 seconds so student sees mentor replies
-  useEffect(() => {
-    const id = setInterval(loadThread, 5000);
-    return () => clearInterval(id);
-  }, [loadThread]);
+  // Stage file instead of uploading immediately
+  const stageFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.size > MAX_FILE_MB * 1024 * 1024) { onToast(`Max ${MAX_FILE_MB} MB allowed`, "error"); return; }
+    setStagedFile({
+      file,
+      previewUrl: URL.createObjectURL(file),
+      isImg: file.type.startsWith("image/"),
+      isPdf: file.type === "application/pdf",
+      name: file.name,
+      size: formatBytes(file.size),
+    });
+    e.target.value = "";
+  };
 
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [thread]);
-
-  const sendText = async () => {
-    if (!text.trim()) return;
+  // Send text + staged file together
+  const sendAll = async () => {
+    const hasText = text.trim().length > 0;
+    const hasFile = !!stagedFile;
+    if (!hasText && !hasFile) return;
     setSending(true);
     try {
+      let imageUrl = null, fileUrl = null;
+      if (stagedFile) {
+        onToast("Uploading… please wait ⏳", "success");
+        const ext = stagedFile.name.split(".").pop();
+        const fname = `student-file-${Date.now()}.${ext}`;
+        const uploaded = await uploadFile(stagedFile.file, fname);
+        if (stagedFile.isImg) imageUrl = uploaded;
+        else fileUrl = uploaded;
+      }
       const row = await insertThread({
         message_id: session.messageId, sender: "student",
-        sender_label: session.studentName, text: text.trim(),
-        audio_url: null, image_url: null, file_url: null,
+        sender_label: session.studentName,
+        text: hasText ? text.trim() : null,
+        audio_url: null, image_url: imageUrl, file_url: fileUrl,
         reply_to_id: replyTo ? replyTo.id : null,
       });
-      setThread(p => [...p, row]); setText(""); setReplyTo(null);
-    } catch { onToast("Failed to send", "error"); }
+      setThread(p => [...p, row]);
+      setText(""); setStagedFile(null); setReplyTo(null);
+      onToast(stagedFile ? (stagedFile.isPdf ? "PDF sent! ✅" : "File sent! ✅") : "", "success");
+    } catch { onToast("Send failed. Try again.", "error"); }
     finally { setSending(false); }
+  };
+
+  const sendText = async () => {
+    if (!text.trim() && !stagedFile) return;
+    await sendAll();
   };
 
   const startRec = async () => {
@@ -778,33 +812,7 @@ function StudentChat({ session, onToast, onEnd }) {
 
   const stopRec = () => { recRef.current?.stop(); recRef.current = null; setIsRec(false); };
 
-  const sendFile = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (file.size > MAX_FILE_MB * 1024 * 1024) {
-      onToast(`File too large. Max ${MAX_FILE_MB} MB allowed.`, "error"); return;
-    }
-    setSending(true);
-    onToast("Uploading file… please wait ⏳", "success");
-    try {
-      const isImg = file.type.startsWith("image/");
-      const isPdf = file.type === "application/pdf";
-      const ext   = file.name.split(".").pop();
-      const fname = `file-${Date.now()}.${ext}`;
-      const uploadedUrl = await uploadFile(file, fname);
-      const row = await insertThread({
-        message_id: session.messageId, sender: "student",
-        sender_label: session.studentName,
-        text: null,
-        image_url: isImg ? uploadedUrl : null,
-        file_url: (!isImg) ? uploadedUrl : null,
-        audio_url: null,
-      });
-      setThread(p => [...p, row]);
-      onToast(isPdf ? "PDF sent! ✅" : "File sent! ✅", "success");
-    } catch { onToast("Upload failed. Try a smaller file.", "error"); }
-    finally { setSending(false); e.target.value = ""; }
-  };
+  const canSend = text.trim().length > 0 || !!stagedFile;
 
   return (
     <div className="student-chat">
@@ -834,10 +842,37 @@ function StudentChat({ session, onToast, onEnd }) {
         <div ref={endRef} />
       </div>
 
+      {/* Staged file preview — shown above input bar */}
+      {stagedFile && (
+        <div style={{
+          display: "flex", alignItems: "center", gap: 10,
+          padding: "8px 14px", background: "#f0f7ff",
+          borderTop: "1.5px solid var(--accent2)",
+        }}>
+          <div style={{ fontSize: 13 }}>
+            {stagedFile.isImg ? "🖼" : stagedFile.isPdf ? "📄" : "📎"}
+          </div>
+          {stagedFile.isImg && (
+            <img src={stagedFile.previewUrl} alt="preview"
+              style={{ width: 40, height: 40, objectFit: "cover", borderRadius: 6, flexShrink: 0 }} />
+          )}
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {stagedFile.name}
+            </div>
+            <div style={{ fontSize: 11, color: "var(--ink3)" }}>{stagedFile.size} · Ready to send</div>
+          </div>
+          <button onClick={() => setStagedFile(null)}
+            style={{ background: "none", border: "none", cursor: "pointer", color: "var(--ink3)", fontSize: 18, padding: "2px 4px" }}>
+            ×
+          </button>
+        </div>
+      )}
+
       {/* Reply-to preview bar */}
       <ReplyBar replyTo={replyTo} onCancel={() => setReplyTo(null)} />
 
-      {/* Input */}
+      {/* Input bar */}
       <div className="reply-bar">
         {!isRec
           ? <button className="btn btn-ghost" style={{ padding: 8, flexShrink: 0 }} onClick={startRec}
@@ -851,7 +886,7 @@ function StudentChat({ session, onToast, onEnd }) {
               <span className="text-sm" style={{ color: "var(--red)" }}>Recording… tap Stop to send</span>
             </div>
           : <textarea className="reply-input" rows={1}
-              placeholder="Continue the conversation… (Enter to send)"
+              placeholder={stagedFile ? "Add a message with your file… (optional)" : "Continue the conversation… (Enter to send)"}
               value={text}
               onChange={e => setText(e.target.value)}
               onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendText(); } }}
@@ -859,10 +894,11 @@ function StudentChat({ session, onToast, onEnd }) {
         }
         <button className="btn btn-ghost" style={{ padding: 8, flexShrink: 0 }}
           onClick={() => fileRef.current?.click()} title="Attach PDF or file"><Icons.Attach /></button>
-        <input ref={fileRef} type="file" accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt"
-          style={{ display: "none" }} onChange={sendFile} />
+        <input ref={fileRef} type="file"
+          accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt"
+          style={{ display: "none" }} onChange={stageFile} />
         {!isRec && (
-          <button className="send-btn" onClick={sendText} disabled={sending || !text.trim()}>
+          <button className="send-btn" onClick={sendAll} disabled={sending || !canSend}>
             {sending ? <span className="spinner" /> : <Icons.Send />}
           </button>
         )}
@@ -956,7 +992,8 @@ function MentorInbox({ onToast }) {
   const [loading, setLoading]   = useState(true);
   const [sending, setSending]   = useState(false);
   const [isRec, setIsRec]       = useState(false);
-  const [replyTo, setReplyTo]   = useState(null); // quoted message
+  const [replyTo, setReplyTo]   = useState(null);
+  const [stagedFile, setStagedFile] = useState(null); // staged file preview before sending
   const [confirmDelete, setConfirmDelete] = useState(null);
   const recRef  = useRef(null);
   const chunks  = useRef([]);
@@ -976,6 +1013,8 @@ function MentorInbox({ onToast }) {
 
   useEffect(() => {
     if (!activeId) return;
+    setStagedFile(null);
+    setReplyTo(null);
     fetchThread(activeId).then(setThread).catch(() => {});
   }, [activeId]);
 
@@ -991,20 +1030,48 @@ function MentorInbox({ onToast }) {
   }, [thread]);
 
   const sendReply = async () => {
-    if (!reply.trim() || !activeId) return;
+    const hasText = reply.trim().length > 0;
+    const hasFile = !!stagedFile;
+    if (!hasText && !hasFile || !activeId) return;
     setSending(true);
     try {
+      let imageUrl = null, fileUrl = null;
+      if (stagedFile) {
+        onToast("Uploading… please wait ⏳", "success");
+        const ext = stagedFile.name.split(".").pop();
+        const fname = `mentor-file-${Date.now()}.${ext}`;
+        const uploaded = await uploadFile(stagedFile.file, fname);
+        if (stagedFile.isImg) imageUrl = uploaded;
+        else fileUrl = uploaded;
+      }
       const row = await insertThread({
         message_id: activeId, sender: "mentor", sender_label: "Mentor",
-        text: reply.trim(), audio_url: null, image_url: null, file_url: null,
+        text: hasText ? reply.trim() : null,
+        audio_url: null, image_url: imageUrl, file_url: fileUrl,
         reply_to_id: replyTo ? replyTo.id : null,
       });
       await markReplied(activeId);
       setThread(p => [...p, row]);
       setMessages(p => p.map(m => m.id === activeId ? { ...m, status: "Replied" } : m));
-      setReply(""); setReplyTo(null); onToast("Reply sent!", "success");
+      setReply(""); setStagedFile(null); setReplyTo(null);
+      onToast("Sent! ✅", "success");
     } catch { onToast("Failed to send", "error"); }
     finally { setSending(false); }
+  };
+
+  const stageFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.size > MAX_FILE_MB * 1024 * 1024) { onToast(`Max ${MAX_FILE_MB} MB allowed`, "error"); return; }
+    setStagedFile({
+      file,
+      previewUrl: URL.createObjectURL(file),
+      isImg: file.type.startsWith("image/"),
+      isPdf: file.type === "application/pdf",
+      name: file.name,
+      size: formatBytes(file.size),
+    });
+    e.target.value = "";
   };
 
   const startRec = async () => {
@@ -1210,6 +1277,33 @@ function MentorInbox({ onToast }) {
               {/* Reply-to preview bar */}
               <ReplyBar replyTo={replyTo} onCancel={() => setReplyTo(null)} />
 
+              {/* Staged file preview */}
+              {stagedFile && (
+                <div style={{
+                  display: "flex", alignItems: "center", gap: 10,
+                  padding: "8px 14px", background: "#f0f7ff",
+                  borderTop: "1.5px solid var(--accent2)",
+                }}>
+                  <div style={{ fontSize: 13 }}>
+                    {stagedFile.isImg ? "🖼" : stagedFile.isPdf ? "📄" : "📎"}
+                  </div>
+                  {stagedFile.isImg && (
+                    <img src={stagedFile.previewUrl} alt="preview"
+                      style={{ width: 40, height: 40, objectFit: "cover", borderRadius: 6, flexShrink: 0 }} />
+                  )}
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {stagedFile.name}
+                    </div>
+                    <div style={{ fontSize: 11, color: "var(--ink3)" }}>{stagedFile.size} · Ready to send</div>
+                  </div>
+                  <button onClick={() => setStagedFile(null)}
+                    style={{ background: "none", border: "none", cursor: "pointer", color: "var(--ink3)", fontSize: 18, padding: "2px 4px" }}>
+                    ×
+                  </button>
+                </div>
+              )}
+
               {/* Reply bar */}
               <div className="reply-bar">
                 {!isRec
@@ -1223,7 +1317,7 @@ function MentorInbox({ onToast }) {
                       <span className="text-sm" style={{ color: "var(--red)" }}>Recording voice reply…</span>
                     </div>
                   : <textarea className="reply-input" rows={1}
-                      placeholder="Reply to student… (Enter to send, Shift+Enter = new line)"
+                      placeholder={stagedFile ? "Add a message with your file… (optional)" : "Reply to student… (Enter to send, Shift+Enter = new line)"}
                       value={reply}
                       onChange={e => setReply(e.target.value)}
                       onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendReply(); } }}
@@ -1231,33 +1325,12 @@ function MentorInbox({ onToast }) {
                 }
                 <button className="btn btn-ghost" style={{ padding: 8, flexShrink: 0 }}
                   onClick={() => fileRef.current?.click()} title="Attach file"><Icons.Attach /></button>
-                <input ref={fileRef} type="file" accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt"
-                  style={{ display: "none" }} onChange={async (e) => {
-                    const file = e.target.files?.[0];
-                    if (!file || !activeId) return;
-                    if (file.size > MAX_FILE_MB * 1024 * 1024) {
-                      onToast(`File too large. Max ${MAX_FILE_MB} MB.`, "error"); return;
-                    }
-                    onToast("Uploading… please wait ⏳", "success");
-                    try {
-                      const isImg = file.type.startsWith("image/");
-                      const ext = file.name.split(".").pop();
-                      const fname = `mentor-file-${Date.now()}.${ext}`;
-                      const uploadedUrl = await uploadFile(file, fname);
-                      const row = await insertThread({
-                        message_id: activeId, sender: "mentor", sender_label: "Mentor",
-                        text: null,
-                        image_url: isImg ? uploadedUrl : null,
-                        file_url: !isImg ? uploadedUrl : null,
-                        audio_url: null,
-                      });
-                      await markReplied(activeId); setThread(p => [...p, row]);
-                      onToast("File sent! ✅", "success");
-                    } catch { onToast("Upload failed. Try a smaller file.", "error"); }
-                    e.target.value = "";
-                  }} />
+                <input ref={fileRef} type="file"
+                  accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt"
+                  style={{ display: "none" }} onChange={stageFile} />
                 {!isRec && (
-                  <button className="send-btn" onClick={sendReply} disabled={sending || !reply.trim()}>
+                  <button className="send-btn" onClick={sendReply}
+                    disabled={sending || (!reply.trim() && !stagedFile)}>
                     {sending ? <span className="spinner" /> : <Icons.Send />}
                   </button>
                 )}
