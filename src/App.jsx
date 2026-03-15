@@ -299,13 +299,115 @@ function Toast({ msg, type, onDone }) {
   return <div className={`toast toast-${type}`}>{msg}</div>;
 }
 
-// ── Message Bubble (shared) ───────────────────────────────────────────────────
-function MsgBubble({ msg, isMine }) {
-  const isPdf = msg.file_url && msg.file_url.toLowerCase().includes(".pdf");
+// ── Quote preview (shown inside bubble when replying to a message) ────────────
+function QuotePreview({ quoted, isMine }) {
+  if (!quoted) return null;
+  const label = quoted.sender === "mentor" ? "You" : (quoted.sender_label || "Student");
+  const preview = quoted.text
+    ? quoted.text.slice(0, 80) + (quoted.text.length > 80 ? "…" : "")
+    : quoted.audio_url ? "🎤 Voice note"
+    : quoted.image_url ? "🖼 Image"
+    : quoted.file_url  ? "📄 File"
+    : "Message";
   return (
-    <div className={`msg-row ${isMine ? "mine" : "theirs"}`}>
+    <div style={{
+      borderLeft: `3px solid ${isMine ? "rgba(255,255,255,.5)" : "var(--accent2)"}`,
+      paddingLeft: 8, marginBottom: 6,
+      background: isMine ? "rgba(255,255,255,.1)" : "var(--surface3)",
+      borderRadius: "0 6px 6px 0", padding: "5px 8px",
+    }}>
+      <div style={{ fontSize: 11, fontWeight: 700, color: isMine ? "#93c5fd" : "var(--accent)", marginBottom: 2 }}>
+        {label}
+      </div>
+      <div style={{ fontSize: 12, opacity: .8, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+        {preview}
+      </div>
+    </div>
+  );
+}
+
+// ── Message Bubble with swipe-to-reply ────────────────────────────────────────
+function MsgBubble({ msg, isMine, onReply, allMsgs }) {
+  const isPdf    = msg.file_url && msg.file_url.toLowerCase().includes(".pdf");
+  const touchRef = useRef(null);
+  const rowRef   = useRef(null);
+  const [swipeX, setSwipeX] = useState(0);
+  const [swiping, setSwiping] = useState(false);
+
+  // Find quoted message object
+  const quoted = msg.reply_to_id ? allMsgs?.find(m => m.id === msg.reply_to_id) : null;
+
+  // ── Touch swipe (mobile) ──
+  const onTouchStart = (e) => {
+    touchRef.current = { x: e.touches[0].clientX, triggered: false };
+    setSwiping(true);
+  };
+  const onTouchMove = (e) => {
+    if (!touchRef.current) return;
+    const dx = e.touches[0].clientX - touchRef.current.x;
+    // swipe right on "theirs", swipe left on "mine" — both trigger reply
+    const dir = isMine ? -1 : 1;
+    const clamped = Math.max(0, Math.min(60, dx * dir));
+    setSwipeX(clamped * dir);
+    if (clamped > 40 && !touchRef.current.triggered) {
+      touchRef.current.triggered = true;
+      if (navigator.vibrate) navigator.vibrate(30);
+      onReply(msg);
+    }
+  };
+  const onTouchEnd = () => {
+    setSwipeX(0); setSwiping(false); touchRef.current = null;
+  };
+
+  // ── Mouse hover reply button (desktop) ──
+  const [hovered, setHovered] = useState(false);
+
+  return (
+    <div
+      ref={rowRef}
+      className={`msg-row ${isMine ? "mine" : "theirs"}`}
+      style={{ position: "relative" }}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      onTouchStart={onTouchStart}
+      onTouchMove={onTouchMove}
+      onTouchEnd={onTouchEnd}
+    >
       <div className="msg-sender">{isMine ? "You" : (msg.sender_label || "Student")}</div>
-      <div className={`bubble ${isMine ? "bubble-you" : "bubble-student"}`}>
+
+      {/* Swipe reply icon — shown on swipe or hover */}
+      {(hovered || Math.abs(swipeX) > 5) && (
+        <button
+          onClick={() => onReply(msg)}
+          title="Reply to this message"
+          style={{
+            position: "absolute", top: "50%", transform: "translateY(-50%)",
+            [isMine ? "left" : "right"]: hovered ? -36 : Math.abs(swipeX) > 5 ? 4 : -36,
+            background: "var(--surface3)", border: "1.5px solid var(--border)",
+            borderRadius: "50%", width: 28, height: 28,
+            display: "flex", alignItems: "center", justifyContent: "center",
+            cursor: "pointer", color: "var(--accent2)", transition: "opacity .15s",
+            zIndex: 2,
+          }}>
+          <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+            strokeWidth={2.2} strokeLinecap="round" strokeLinejoin="round">
+            <path d="M9 17H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11a2 2 0 0 1 2 2v3" />
+            <path d="M13 21l-4-4 4-4" />
+            <path d="M9 17h8a2 2 0 0 0 2-2v-3" />
+          </svg>
+        </button>
+      )}
+
+      <div
+        className={`bubble ${isMine ? "bubble-you" : "bubble-student"}`}
+        style={{
+          transform: `translateX(${swipeX}px)`,
+          transition: swiping ? "none" : "transform .2s ease",
+        }}
+      >
+        {/* Quoted message preview */}
+        {quoted && <QuotePreview quoted={quoted} isMine={isMine} />}
+
         {msg.text && <div>{msg.text}</div>}
         {msg.audio_url && (
           <audio controls src={msg.audio_url}
@@ -335,6 +437,40 @@ function MsgBubble({ msg, isMine }) {
         )}
         <div className="bubble-time">{timeLabel(msg.created_at)}</div>
       </div>
+    </div>
+  );
+}
+
+// ── Reply preview bar (shown above input when replying to a message) ──────────
+function ReplyBar({ replyTo, onCancel, allMsgs }) {
+  if (!replyTo) return null;
+  const label = replyTo.sender === "mentor" ? "You" : (replyTo.sender_label || "Student");
+  const preview = replyTo.text
+    ? replyTo.text.slice(0, 100)
+    : replyTo.audio_url ? "🎤 Voice note"
+    : replyTo.image_url ? "🖼 Image"
+    : replyTo.file_url  ? "📄 File"
+    : "Message";
+  return (
+    <div style={{
+      display: "flex", alignItems: "center", gap: 10,
+      padding: "8px 14px", background: "#f0f7ff",
+      borderTop: "1.5px solid var(--accent2)",
+      borderLeft: "4px solid var(--accent2)",
+    }}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: "var(--accent)", marginBottom: 2 }}>
+          Replying to {label}
+        </div>
+        <div style={{ fontSize: 12, color: "var(--ink2)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+          {preview}
+        </div>
+      </div>
+      <button onClick={onCancel}
+        style={{ background: "none", border: "none", cursor: "pointer", color: "var(--ink3)",
+          fontSize: 18, lineHeight: 1, padding: "2px 4px", flexShrink: 0 }}>
+        ×
+      </button>
     </div>
   );
 }
@@ -575,6 +711,7 @@ function StudentChat({ session, onToast, onEnd }) {
   const [text, setText]       = useState("");
   const [sending, setSending] = useState(false);
   const [isRec, setIsRec]     = useState(false);
+  const [replyTo, setReplyTo] = useState(null); // quoted message
   const recRef = useRef(null);
   const chunks = useRef([]);
   const fileRef = useRef(null);
@@ -604,8 +741,9 @@ function StudentChat({ session, onToast, onEnd }) {
         message_id: session.messageId, sender: "student",
         sender_label: session.studentName, text: text.trim(),
         audio_url: null, image_url: null, file_url: null,
+        reply_to_id: replyTo ? replyTo.id : null,
       });
-      setThread(p => [...p, row]); setText("");
+      setThread(p => [...p, row]); setText(""); setReplyTo(null);
     } catch { onToast("Failed to send", "error"); }
     finally { setSending(false); }
   };
@@ -627,8 +765,9 @@ function StudentChat({ session, onToast, onEnd }) {
             message_id: session.messageId, sender: "student",
             sender_label: session.studentName, text: null,
             audio_url: audioUrl, image_url: null, file_url: null,
+            reply_to_id: replyTo ? replyTo.id : null,
           });
-          setThread(p => [...p, row]);
+          setThread(p => [...p, row]); setReplyTo(null);
           onToast("Voice note sent!", "success");
         } catch { onToast("Failed to send voice note", "error"); }
         finally { setSending(false); }
@@ -689,10 +828,14 @@ function StudentChat({ session, onToast, onEnd }) {
           <div className="empty">Your message was sent! Waiting for a reply…</div>
         )}
         {thread.map(msg => (
-          <MsgBubble key={msg.id} msg={msg} isMine={msg.sender === "student"} />
+          <MsgBubble key={msg.id} msg={msg} isMine={msg.sender === "student"}
+            onReply={setReplyTo} allMsgs={thread} />
         ))}
         <div ref={endRef} />
       </div>
+
+      {/* Reply-to preview bar */}
+      <ReplyBar replyTo={replyTo} onCancel={() => setReplyTo(null)} />
 
       {/* Input */}
       <div className="reply-bar">
@@ -809,11 +952,12 @@ function MentorInbox({ onToast }) {
   const [thread, setThread]     = useState([]);
   const [reply, setReply]       = useState("");
   const [search, setSearch]     = useState("");
-  const [filter, setFilter]     = useState("all"); // "all" | "unread"
+  const [filter, setFilter]     = useState("all");
   const [loading, setLoading]   = useState(true);
   const [sending, setSending]   = useState(false);
   const [isRec, setIsRec]       = useState(false);
-  const [confirmDelete, setConfirmDelete] = useState(null); // id of convo to delete
+  const [replyTo, setReplyTo]   = useState(null); // quoted message
+  const [confirmDelete, setConfirmDelete] = useState(null);
   const recRef  = useRef(null);
   const chunks  = useRef([]);
   const fileRef = useRef(null);
@@ -853,11 +997,12 @@ function MentorInbox({ onToast }) {
       const row = await insertThread({
         message_id: activeId, sender: "mentor", sender_label: "Mentor",
         text: reply.trim(), audio_url: null, image_url: null, file_url: null,
+        reply_to_id: replyTo ? replyTo.id : null,
       });
       await markReplied(activeId);
       setThread(p => [...p, row]);
       setMessages(p => p.map(m => m.id === activeId ? { ...m, status: "Replied" } : m));
-      setReply(""); onToast("Reply sent!", "success");
+      setReply(""); setReplyTo(null); onToast("Reply sent!", "success");
     } catch { onToast("Failed to send", "error"); }
     finally { setSending(false); }
   };
@@ -878,10 +1023,12 @@ function MentorInbox({ onToast }) {
           const row = await insertThread({
             message_id: activeId, sender: "mentor", sender_label: "Mentor",
             text: null, audio_url: audioUrl, image_url: null, file_url: null,
+            reply_to_id: replyTo ? replyTo.id : null,
           });
           await markReplied(activeId);
           setThread(p => [...p, row]);
           setMessages(p => p.map(m => m.id === activeId ? { ...m, status: "Replied" } : m));
+          setReplyTo(null);
           onToast("Voice reply sent!", "success");
         } catch { onToast("Voice reply failed", "error"); }
         finally { setSending(false); }
@@ -1046,18 +1193,22 @@ function MentorInbox({ onToast }) {
                 </div>
               </div>
 
-              {/* Full thread — FIX #3 */}
+              {/* Full thread */}
               <div className="chat-thread">
                 {thread.length === 0
                   ? <div style={{ color: "var(--ink2)", fontSize: 13, textAlign: "center", paddingTop: 20 }}>
                       No thread messages yet.
                     </div>
                   : thread.map(msg => (
-                      <MsgBubble key={msg.id} msg={msg} isMine={msg.sender === "mentor"} />
+                      <MsgBubble key={msg.id} msg={msg} isMine={msg.sender === "mentor"}
+                        onReply={setReplyTo} allMsgs={thread} />
                     ))
                 }
                 <div ref={endRef} />
               </div>
+
+              {/* Reply-to preview bar */}
+              <ReplyBar replyTo={replyTo} onCancel={() => setReplyTo(null)} />
 
               {/* Reply bar */}
               <div className="reply-bar">
