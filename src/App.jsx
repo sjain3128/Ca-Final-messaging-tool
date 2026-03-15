@@ -1,5 +1,39 @@
 import React, { useEffect, useRef, useState, useCallback } from "react";
 
+// ── Service Worker registration + background notification helpers ─────────────
+const SW_URL = "/sw.js";
+
+async function registerSW() {
+  if (!("serviceWorker" in navigator)) return null;
+  try {
+    const reg = await navigator.serviceWorker.register(SW_URL);
+    await navigator.serviceWorker.ready;
+    return reg;
+  } catch (e) {
+    console.warn("SW registration failed:", e);
+    return null;
+  }
+}
+
+async function requestNotifPermission() {
+  if (!("Notification" in window)) return false;
+  if (Notification.permission === "granted") return true;
+  const result = await Notification.requestPermission();
+  return result === "granted";
+}
+
+// Send current role/session state to SW so it can poll when app is closed
+function updateSWState(state) {
+  if (!("serviceWorker" in navigator) || !navigator.serviceWorker.controller) return;
+  navigator.serviceWorker.controller.postMessage({ type: "UPDATE_STATE", state });
+}
+
+// Show an immediate local notification (works when app IS open)
+function showLocalNotif(title, body, tag) {
+  if (Notification.permission !== "granted") return;
+  try { new Notification(title, { body, tag, icon: "/icon-192.png" }); } catch {}
+}
+
 // ── Supabase ──────────────────────────────────────────────────────────────────
 const SUPABASE_URL = "https://xzpvciyypdkysiyiqyhs.supabase.co";
 const SUPABASE_ANON_KEY =
@@ -28,6 +62,29 @@ const insertThread  = (p) => sbFetch("/thread_messages", { method: "POST", body:
 const markReplied     = (id) => sbFetch(`/messages?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "Replied" }) });
 const deleteMessage   = (id) => sbFetch(`/messages?id=eq.${id}`, { method: "DELETE" });
 const deleteThread    = (mid) => sbFetch(`/thread_messages?message_id=eq.${mid}`, { method: "DELETE" });
+const editThreadMsg   = (id, text) => sbFetch(`/thread_messages?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ text, edited: true, edited_at: new Date().toISOString() }) });
+
+// Upsert student profile by mobile (returns existing or creates new)
+async function upsertStudentProfile(name, mobile) {
+  // Try find existing
+  const existing = await sbFetch(`/student_profiles?mobile=eq.${encodeURIComponent(mobile)}&select=*`);
+  if (existing.length > 0) {
+    // Update name in case they changed it
+    await sbFetch(`/student_profiles?mobile=eq.${encodeURIComponent(mobile)}`, {
+      method: "PATCH", body: JSON.stringify({ name }),
+    });
+    return existing[0];
+  }
+  // Create new
+  const rows = await sbFetch("/student_profiles", { method: "POST", body: JSON.stringify({ name, mobile }) });
+  return rows[0];
+}
+
+// Find student's existing open conversation
+async function findStudentConversation(profileId) {
+  const rows = await sbFetch(`/messages?student_profile_id=eq.${profileId}&select=*&order=created_at.desc&limit=1`);
+  return rows[0] || null;
+}
 
 async function uploadAudio(blob, filename) {
   const res = await fetch(`${SUPABASE_URL}/storage/v1/object/audio-notes/${filename}`, {
@@ -80,8 +137,10 @@ const MAX_LOCK_TRIES   = 5;
 const LOCKOUT_MS       = 5 * 60 * 1000;
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
-const MAX_FILE_MB = 50; // increased to 50 MB for PDFs and large files
-const STUDENT_SESSION_KEY = "ca-student-session";
+const MAX_FILE_MB = 50;
+// Use localStorage so session persists across browser restarts
+const STUDENT_SESSION_KEY = "ca-student-session-v2";
+const STUDENT_PROFILE_KEY = "ca-student-profile-v2";
 
 function timeLabel(iso) {
   const d = iso ? new Date(iso) : new Date();
@@ -125,6 +184,8 @@ const Icons = {
   Eye:       () => <Icon d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8zM12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z" />,
   EyeOff:    () => <Icon d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24M1 1l22 22" />,
   LogOut:    () => <Icon d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" />,
+  Edit:      () => <Icon d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />,
+  Phone:     () => <Icon d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07A19.5 19.5 0 0 1 4.69 13a19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 3.22 2h3a2 2 0 0 1 2 1.72c.127.96.361 1.903.7 2.81a2 2 0 0 1-.45 2.11L7.91 9.91a16 16 0 0 0 6.18 6.18l1.27-1.27a2 2 0 0 1 2.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0 1 22 16.92z" />,
 };
 
 // ── CSS ───────────────────────────────────────────────────────────────────────
@@ -292,6 +353,27 @@ const css = `
   .mt-16{margin-top:16px} .mt-20{margin-top:20px} .mt-24{margin-top:24px}
   .text-sm{font-size:13px} .text-xs{font-size:12px}
   .text-muted{color:var(--ink2)} .font-semibold{font-weight:600}
+
+  /* ── Login page ── */
+  .login-screen { min-height:100vh; display:flex; align-items:center; justify-content:center; background:linear-gradient(135deg,#f0f4f8 0%,#e8f0fe 100%); padding:20px; }
+  .login-card { background:white; border-radius:24px; box-shadow:0 4px 40px rgba(0,0,0,.12); padding:48px 40px; max-width:420px; width:100%; }
+  .login-logo { width:56px; height:56px; background:#0f172a; border-radius:16px; display:flex; align-items:center; justify-content:center; margin:0 auto 20px; color:white; }
+  .login-title { font-family:'DM Serif Display',serif; font-size:26px; text-align:center; margin-bottom:6px; }
+  .login-sub { font-size:13px; color:var(--ink2); text-align:center; margin-bottom:28px; line-height:1.6; }
+  .login-disclaimer { background:#fef9ec; border:1px solid #fde68a; border-radius:10px; padding:10px 14px; font-size:12px; color:#92400e; line-height:1.6; margin-top:16px; }
+  .login-btn { width:100%; padding:13px; background:#0f172a; color:white; border:none; border-radius:var(--radius-sm); font-family:'DM Sans',sans-serif; font-size:15px; font-weight:600; cursor:pointer; transition:background .15s; margin-top:20px; }
+  .login-btn:hover { background:#1e293b; }
+  .login-btn:disabled { opacity:.5; cursor:not-allowed; }
+  .logout-btn { background:none; border:1.5px solid rgba(255,255,255,.2); color:rgba(255,255,255,.8); border-radius:8px; padding:4px 10px; font-family:'DM Sans',sans-serif; font-size:12px; cursor:pointer; }
+  .logout-btn:hover { background:rgba(255,255,255,.1); }
+
+  /* ── Edit message ── */
+  .bubble-edit-input { background:transparent; border:none; border-bottom:1.5px solid rgba(255,255,255,.4); outline:none; font-family:'DM Sans',sans-serif; font-size:13px; color:white; width:100%; padding:2px 0; line-height:1.6; }
+  .bubble-edit-input.light { border-bottom-color:var(--accent2); color:var(--ink); }
+  .edited-label { font-size:10px; opacity:.5; margin-left:4px; }
+
+  /* ── Notification dot ── */
+  .notif-dot { width:8px; height:8px; background:var(--red); border-radius:50%; display:inline-block; margin-left:4px; animation:blink 1.5s infinite; }
 `;
 
 // ── Toast ─────────────────────────────────────────────────────────────────────
@@ -335,35 +417,34 @@ function QuotePreview({ quoted, isMine, onScrollTo }) {
   );
 }
 
-// ── Message Bubble with swipe-to-reply + scroll-to-original ──────────────────
-function MsgBubble({ msg, isMine, onReply, allMsgs, onScrollTo }) {
+// ── Message Bubble with swipe-to-reply + scroll-to-original + edit ───────────
+function MsgBubble({ msg, isMine, onReply, allMsgs, onScrollTo, onEdit }) {
   const isPdf    = msg.file_url && msg.file_url.toLowerCase().includes(".pdf");
   const touchRef = useRef(null);
   const rowRef   = useRef(null);
-  const [swipeX, setSwipeX]   = useState(0);
-  const [swiping, setSwiping] = useState(false);
-  const [highlighted, setHighlighted] = useState(false);
+  const editRef  = useRef(null);
+  const [swipeX, setSwipeX]     = useState(0);
+  const [swiping, setSwiping]   = useState(false);
+  const [hovered, setHovered]   = useState(false);
+  const [editing, setEditing]   = useState(false);
+  const [editText, setEditText] = useState(msg.text || "");
 
-  // Each bubble gets a DOM id so it can be scrolled to
-  // id is set on the outer div as `msg-${msg.id}`
+  // Can only edit own text messages within 10 minutes
+  const canEdit = isMine && msg.text && !msg.audio_url && !msg.image_url && !msg.file_url &&
+    (Date.now() - new Date(msg.created_at).getTime()) < 10 * 60 * 1000;
 
-  // Find quoted message object
   const quoted = msg.reply_to_id ? allMsgs?.find(m => m.id === msg.reply_to_id) : null;
 
-  // Called by parent when another bubble's QuotePreview is clicked pointing here
-  useEffect(() => {
-    if (highlighted) {
-      const t = setTimeout(() => setHighlighted(false), 1500);
-      return () => clearTimeout(t);
-    }
-  }, [highlighted]);
-
-  // ── Touch swipe (mobile) ──
-  const onTouchStart = (e) => {
-    touchRef.current = { x: e.touches[0].clientX, triggered: false };
-    setSwiping(true);
+  const startEdit = () => { setEditText(msg.text); setEditing(true); setTimeout(() => editRef.current?.focus(), 50); };
+  const cancelEdit = () => { setEditing(false); setEditText(msg.text || ""); };
+  const saveEdit = async () => {
+    if (!editText.trim() || editText.trim() === msg.text) { cancelEdit(); return; }
+    await onEdit(msg.id, editText.trim());
+    setEditing(false);
   };
-  const onTouchMove = (e) => {
+
+  const onTouchStart = (e) => { touchRef.current = { x: e.touches[0].clientX, triggered: false }; setSwiping(true); };
+  const onTouchMove  = (e) => {
     if (!touchRef.current) return;
     const dx = e.touches[0].clientX - touchRef.current.x;
     const dir = isMine ? -1 : 1;
@@ -377,64 +458,72 @@ function MsgBubble({ msg, isMine, onReply, allMsgs, onScrollTo }) {
   };
   const onTouchEnd = () => { setSwipeX(0); setSwiping(false); touchRef.current = null; };
 
-  const [hovered, setHovered] = useState(false);
-
   return (
     <div
       id={`msg-${msg.id}`}
       ref={rowRef}
       className={`msg-row ${isMine ? "mine" : "theirs"}`}
-      style={{
-        position: "relative",
-        paddingLeft: isMine ? 0 : 36,
-        paddingRight: isMine ? 36 : 0,
-        borderRadius: 10,
-        transition: "background .3s ease",
-        background: highlighted ? (isMine ? "rgba(59,130,246,.15)" : "rgba(59,130,246,.12)") : "transparent",
-      }}
+      style={{ position: "relative", paddingLeft: isMine ? 0 : 36, paddingRight: isMine ? 36 : 0, borderRadius: 10, transition: "background .3s ease" }}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
-      onTouchStart={onTouchStart}
-      onTouchMove={onTouchMove}
-      onTouchEnd={onTouchEnd}
+      onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}
     >
       <div className="msg-sender">{isMine ? "You" : (msg.sender_label || "Student")}</div>
 
       {/* Reply button */}
-      <button
-        onClick={() => onReply(msg)}
-        title="Reply to this message"
-        style={{
-          position: "absolute", top: "50%", transform: "translateY(-50%)",
+      <button onClick={() => onReply(msg)} title="Reply"
+        style={{ position: "absolute", top: "50%", transform: "translateY(-50%)",
           ...(isMine ? { right: 0 } : { left: 0 }),
           background: hovered ? "var(--surface3)" : "transparent",
           border: hovered ? "1.5px solid var(--border)" : "1.5px solid transparent",
-          borderRadius: "50%", width: 28, height: 28,
-          display: "flex", alignItems: "center", justifyContent: "center",
-          cursor: "pointer",
+          borderRadius: "50%", width: 28, height: 28, display: "flex", alignItems: "center",
+          justifyContent: "center", cursor: "pointer",
           color: hovered ? "var(--accent2)" : "transparent",
-          transition: "all .15s", zIndex: 2, flexShrink: 0,
-        }}>
+          transition: "all .15s", zIndex: 2, flexShrink: 0 }}>
         <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor"
           strokeWidth={2.2} strokeLinecap="round" strokeLinejoin="round">
           <path d="M9 17H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11a2 2 0 0 1 2 2v3" />
-          <path d="M13 21l-4-4 4-4" />
-          <path d="M9 17h8a2 2 0 0 0 2-2v-3" />
+          <path d="M13 21l-4-4 4-4" /><path d="M9 17h8a2 2 0 0 0 2-2v-3" />
         </svg>
       </button>
 
-      <div
-        className={`bubble ${isMine ? "bubble-you" : "bubble-student"}`}
-        style={{ transform: `translateX(${swipeX}px)`, transition: swiping ? "none" : "transform .2s ease" }}
-      >
-        {/* Quoted preview — clickable to scroll to original */}
-        {quoted && (
-          <QuotePreview quoted={quoted} isMine={isMine} onScrollTo={onScrollTo} />
-        )}
+      <div className={`bubble ${isMine ? "bubble-you" : "bubble-student"}`}
+        style={{ transform: `translateX(${swipeX}px)`, transition: swiping ? "none" : "transform .2s ease" }}>
+        {quoted && <QuotePreview quoted={quoted} isMine={isMine} onScrollTo={onScrollTo} />}
 
-        {msg.text && <div>{msg.text}</div>}
+        {/* Editable text area */}
+        {msg.text && !editing && (
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 6 }}>
+            <div style={{ flex: 1 }}>{msg.text}</div>
+            {canEdit && hovered && (
+              <button onClick={startEdit} title="Edit (within 10 min)"
+                style={{ background: "none", border: "none", cursor: "pointer",
+                  color: "rgba(255,255,255,.6)", padding: "0 2px", flexShrink: 0, marginTop: 1 }}>
+                <Icons.Edit />
+              </button>
+            )}
+          </div>
+        )}
+        {editing && (
+          <div>
+            <input ref={editRef} className={`bubble-edit-input${isMine ? "" : " light"}`}
+              value={editText} onChange={e => setEditText(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter") saveEdit(); if (e.key === "Escape") cancelEdit(); }} />
+            <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+              <button onClick={saveEdit}
+                style={{ background: "rgba(255,255,255,.2)", border: "none", color: "white",
+                  borderRadius: 6, padding: "3px 10px", fontSize: 12, cursor: "pointer" }}>Save</button>
+              <button onClick={cancelEdit}
+                style={{ background: "transparent", border: "none", color: "rgba(255,255,255,.6)",
+                  borderRadius: 6, padding: "3px 10px", fontSize: 12, cursor: "pointer" }}>Cancel</button>
+            </div>
+          </div>
+        )}
+        {msg.edited && !editing && <span className="edited-label">(edited)</span>}
+
         {msg.audio_url && (
-          <audio controls src={msg.audio_url}
+          <audio controls src={msg.audio_url} crossOrigin="anonymous"
+            onError={(e) => { e.target.removeAttribute('crossorigin'); e.target.load(); }}
             style={{ width: 220, height: 34, marginTop: msg.text ? 8 : 0, display: "block" }} />
         )}
         {msg.image_url && (
@@ -443,13 +532,11 @@ function MsgBubble({ msg, isMine, onReply, allMsgs, onScrollTo }) {
         )}
         {msg.file_url && (
           <a href={msg.file_url} target="_blank" rel="noreferrer" download
-            style={{
-              display: "flex", alignItems: "center", gap: 8, marginTop: msg.text ? 8 : 0,
+            style={{ display: "flex", alignItems: "center", gap: 8, marginTop: msg.text ? 8 : 0,
               background: isMine ? "rgba(255,255,255,.12)" : "var(--surface3)",
               border: `1px solid ${isMine ? "rgba(255,255,255,.2)" : "var(--border)"}`,
               borderRadius: 8, padding: "8px 12px", textDecoration: "none",
-              color: isMine ? "white" : "var(--accent)", fontSize: 13, fontWeight: 500,
-            }}>
+              color: isMine ? "white" : "var(--accent)", fontSize: 13, fontWeight: 500 }}>
             <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor"
               strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
               <path d={isPdf
@@ -464,7 +551,6 @@ function MsgBubble({ msg, isMine, onReply, allMsgs, onScrollTo }) {
     </div>
   );
 }
-
 // ── Reply preview bar (shown above input when replying to a message) ──────────
 function ReplyBar({ replyTo, onCancel, allMsgs }) {
   if (!replyTo) return null;
@@ -499,27 +585,126 @@ function ReplyBar({ replyTo, onCancel, allMsgs }) {
   );
 }
 
-// ── STUDENT PORTAL (router between form and chat) ─────────────────────────────
+// ── STUDENT LOGIN PAGE ────────────────────────────────────────────────────────
+function StudentLogin({ onLogin }) {
+  const [name, setName]     = useState("");
+  const [mobile, setMobile] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError]   = useState("");
+
+  const handleLogin = async () => {
+    if (!name.trim()) { setError("Please enter your name."); return; }
+    if (!/^[6-9]\d{9}$/.test(mobile.trim())) { setError("Please enter a valid 10-digit Indian mobile number."); return; }
+    setError(""); setLoading(true);
+    try {
+      const profile = await upsertStudentProfile(name.trim(), mobile.trim());
+      // Check if they have an existing conversation
+      const existing = await findStudentConversation(profile.id);
+      onLogin({
+        profileId: profile.id,
+        studentName: profile.name,
+        mobile: profile.mobile,
+        messageId: existing ? existing.id : null,
+      });
+    } catch (e) {
+      setError("Login failed. Please try again.");
+    } finally { setLoading(false); }
+  };
+
+  return (
+    <div className="login-screen">
+      <div className="login-card">
+        <div className="login-logo"><Icons.Lock /></div>
+        <div className="login-title">CA Final Portal</div>
+        <div className="login-sub">Enter your details to access your private conversation with your mentor.</div>
+
+        <div className="field" style={{ marginBottom: 14 }}>
+          <label className="label">Your name</label>
+          <input className="input" placeholder="e.g. Riya Sharma"
+            value={name} onChange={e => setName(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter") handleLogin(); }} />
+        </div>
+
+        <div className="field">
+          <label className="label">
+            Mobile number <span style={{ fontWeight: 400, color: "var(--ink3)" }}>(for notifications only)</span>
+          </label>
+          <div style={{ position: "relative" }}>
+            <span style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)", fontSize: 14, color: "var(--ink2)", pointerEvents: "none" }}>+91</span>
+            <input className="input" style={{ paddingLeft: 44 }} placeholder="10-digit mobile number"
+              value={mobile} onChange={e => setMobile(e.target.value.replace(/\D/g, "").slice(0, 10))}
+              onKeyDown={e => { if (e.key === "Enter") handleLogin(); }}
+              inputMode="numeric" />
+          </div>
+        </div>
+
+        <div className="login-disclaimer">
+          🔒 <strong>Privacy notice:</strong> Your mobile number is used <em>only</em> to notify you when your mentor replies. It is never shared, sold, or stored for any other purpose. You can delete your account at any time by contacting the mentor.
+        </div>
+
+        {error && <div className="error-text mt-8">{error}</div>}
+
+        <button className="login-btn" onClick={handleLogin} disabled={loading || !name.trim() || mobile.length < 10}>
+          {loading ? "Signing in…" : "Continue to chat →"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── STUDENT PORTAL (login → chat router) ─────────────────────────────────────
 function StudentPortal({ onToast }) {
+  // Persist profile AND session in localStorage so they survive browser restart
+  const [profile, setProfile] = useState(() => {
+    try { const p = localStorage.getItem(STUDENT_PROFILE_KEY); return p ? JSON.parse(p) : null; }
+    catch { return null; }
+  });
   const [session, setSession] = useState(() => {
-    try { const s = sessionStorage.getItem(STUDENT_SESSION_KEY); return s ? JSON.parse(s) : null; }
+    try { const s = localStorage.getItem(STUDENT_SESSION_KEY); return s ? JSON.parse(s) : null; }
     catch { return null; }
   });
 
-  if (session) {
-    return <StudentChat session={session} onToast={onToast}
-      onEnd={() => { sessionStorage.removeItem(STUDENT_SESSION_KEY); setSession(null); }} />;
-  }
-  return <StudentForm onToast={onToast} onSession={(s) => {
-    sessionStorage.setItem(STUDENT_SESSION_KEY, JSON.stringify(s));
+  const handleLogin = (loginData) => {
+    const p = { profileId: loginData.profileId, studentName: loginData.studentName, mobile: loginData.mobile };
+    localStorage.setItem(STUDENT_PROFILE_KEY, JSON.stringify(p));
+    setProfile(p);
+    if (loginData.messageId) {
+      const s = { messageId: loginData.messageId, studentName: loginData.studentName };
+      localStorage.setItem(STUDENT_SESSION_KEY, JSON.stringify(s));
+      setSession(s);
+    }
+  };
+
+  const handleNewSession = (s) => {
+    localStorage.setItem(STUDENT_SESSION_KEY, JSON.stringify(s));
     setSession(s);
-  }} />;
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem(STUDENT_PROFILE_KEY);
+    localStorage.removeItem(STUDENT_SESSION_KEY);
+    setProfile(null); setSession(null);
+  };
+
+  const handleEndConvo = () => {
+    localStorage.removeItem(STUDENT_SESSION_KEY);
+    setSession(null);
+  };
+
+  if (!profile) return <StudentLogin onLogin={handleLogin} />;
+
+  if (session) {
+    return <StudentChat session={session} profile={profile} onToast={onToast}
+      onEnd={handleEndConvo} onLogout={handleLogout} />;
+  }
+
+  return <StudentForm profile={profile} onToast={onToast}
+    onSession={handleNewSession} onLogout={handleLogout} />;
 }
 
 // ── STUDENT FORM (first message) ──────────────────────────────────────────────
-function StudentForm({ onToast, onSession }) {
+function StudentForm({ profile, onToast, onSession, onLogout }) {
   const attempts = getAttempts();
-  const [name, setName]       = useState("");
   const [attempt, setAttempt] = useState(attempts[0] || "");
   const [topic, setTopic]     = useState("Preparation strategy");
   const [message, setMessage] = useState("");
@@ -580,10 +765,11 @@ function StudentForm({ onToast, onSession }) {
       else if (atts.length) mode = "Text + File";
 
       const row = await insertMessage({
-        student_name: name.trim() || "Anonymous Student",
+        student_name: profile.studentName,
         attempt, topic, mode,
         message: hasText ? message.trim() : "(Voice/File message)",
         status: "Unread",
+        student_profile_id: profile.profileId,
       });
 
       // Upload audio to Supabase Storage
@@ -627,7 +813,7 @@ function StudentForm({ onToast, onSession }) {
       });
 
       onToast("Message sent!", "success");
-      onSession({ messageId: row.id, studentName: name.trim() || "Anonymous Student" });
+      onSession({ messageId: row.id, studentName: profile.studentName });
     } catch (err) {
       console.error(err);
       setError("Failed to send. Please try again.");
@@ -638,17 +824,28 @@ function StudentForm({ onToast, onSession }) {
   return (
     <div className="card">
       <div className="card-body">
+        {/* Logged-in header */}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20 }}>
+          <div className="flex items-center gap-8">
+            <div className="convo-avatar" style={{ width: 34, height: 34, fontSize: 13 }}>
+              {profile.studentName[0].toUpperCase()}
+            </div>
+            <div>
+              <div style={{ fontWeight: 600, fontSize: 14 }}>{profile.studentName}</div>
+              <div style={{ fontSize: 12, color: "var(--ink3)" }}>Logged in</div>
+            </div>
+          </div>
+          <button className="btn btn-ghost" style={{ fontSize: 12 }} onClick={onLogout}>
+            <Icons.LogOut /> Logout
+          </button>
+        </div>
+
         <div className="flex items-center gap-8" style={{ marginBottom: 20 }}>
           <span className="badge badge-green"><Icons.Lock /> Private portal</span>
           <span className="badge badge-blue">No personal number shared</span>
         </div>
 
         <div className="form-grid">
-          <div className="field">
-            <label className="label">Your name (optional)</label>
-            <input className="input" placeholder="e.g. Riya S. or leave blank"
-              value={name} onChange={e => setName(e.target.value)} />
-          </div>
           {/* FIX #1: dynamic attempt list */}
           <div className="field">
             <label className="label">CA Final attempt</label>
@@ -729,26 +926,68 @@ function StudentForm({ onToast, onSession }) {
   );
 }
 
-// ── FIX #4 — STUDENT LIVE CHAT (continues after first message) ───────────────
-function StudentChat({ session, onToast, onEnd }) {
-  const [thread, setThread]     = useState([]);
-  const [text, setText]         = useState("");
-  const [sending, setSending]   = useState(false);
-  const [isRec, setIsRec]       = useState(false);
-  const [replyTo, setReplyTo]   = useState(null);
-  const [stagedFile, setStagedFile] = useState(null); // { file, previewUrl, isImg, isPdf, name }
-  const recRef = useRef(null);
-  const chunks = useRef([]);
+// ── STUDENT LIVE CHAT ────────────────────────────────────────────────────────
+function StudentChat({ session, profile, onToast, onEnd, onLogout }) {
+  const [thread, setThread]         = useState([]);
+  const [text, setText]             = useState("");
+  const [sending, setSending]       = useState(false);
+  const [isRec, setIsRec]           = useState(false);
+  const [replyTo, setReplyTo]       = useState(null);
+  const [stagedFile, setStagedFile] = useState(null);
+  const [newReply, setNewReply]     = useState(false); // notification dot
+  const recRef  = useRef(null);
+  const chunks  = useRef([]);
   const fileRef = useRef(null);
   const endRef  = useRef(null);
+  const prevLen = useRef(0);
 
   const loadThread = useCallback(async () => {
-    try { setThread(await fetchThread(session.messageId)); } catch {}
+    try {
+      const data = await fetchThread(session.messageId);
+      setThread(data);
+      if (prevLen.current > 0 && data.length > prevLen.current) {
+        const newest = data[data.length - 1];
+        if (newest.sender === "mentor") {
+          setNewReply(true);
+          showLocalNotif(
+            "New reply from your mentor 📩",
+            newest.text || "Voice/file message",
+            "mentor-reply"
+          );
+        }
+      }
+      prevLen.current = data.length;
+    } catch {}
   }, [session.messageId]);
+
+  // Edit a student's own message
+  const handleEdit = useCallback(async (id, newText) => {
+    try {
+      await editThreadMsg(id, newText);
+      setThread(p => p.map(m => m.id === id ? { ...m, text: newText, edited: true } : m));
+      onToast("Message edited ✅", "success");
+    } catch { onToast("Edit failed", "error"); }
+  }, [onToast]);
 
   useEffect(() => { loadThread(); }, [loadThread]);
   useEffect(() => { const id = setInterval(loadThread, 5000); return () => clearInterval(id); }, [loadThread]);
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [thread]);
+
+  // Register SW and request notification permission
+  useEffect(() => {
+    (async () => {
+      await registerSW();
+      await requestNotifPermission();
+      // Tell SW who we are so it can poll for mentor replies when app is closed
+      updateSWState({
+        role: "student",
+        messageId: session.messageId,
+        supabaseUrl: SUPABASE_URL,
+        anonKey: SUPABASE_ANON_KEY,
+        lastMentorMsgAt: null,
+      });
+    })();
+  }, [session.messageId]);
 
   // Scroll to original message and flash highlight
   const scrollToMsg = useCallback((id) => {
@@ -802,7 +1041,7 @@ function StudentChat({ session, onToast, onEnd }) {
         reply_to_id: replyTo ? replyTo.id : null,
       });
       setThread(p => [...p, row]);
-      setText(""); setStagedFile(null); setReplyTo(null);
+      setText(""); setStagedFile(null); setReplyTo(null); setNewReply(false);
       onToast(stagedFile ? (stagedFile.isPdf ? "PDF sent! ✅" : "File sent! ✅") : "", "success");
     } catch { onToast("Send failed. Try again.", "error"); }
     finally { setSending(false); }
@@ -852,13 +1091,17 @@ function StudentChat({ session, onToast, onEnd }) {
           {session.studentName[0].toUpperCase()}
         </div>
         <div style={{ flex: 1 }}>
-          <div style={{ fontWeight: 600, fontSize: 15 }}>{session.studentName}</div>
+          <div style={{ fontWeight: 600, fontSize: 15, display: "flex", alignItems: "center", gap: 6 }}>
+            {session.studentName}
+            {newReply && <span className="notif-dot" title="New reply!" onClick={() => { setNewReply(false); endRef.current?.scrollIntoView({ behavior: "smooth" }); }} style={{ cursor: "pointer" }} />}
+          </div>
           <div style={{ fontSize: 12, color: "#94a3b8", marginTop: 2 }}>
-            Your private conversation · mentor replies appear here every few seconds
+            Your private conversation · replies appear every few seconds
           </div>
         </div>
-        <button className="btn btn-ghost" style={{ color: "#94a3b8", fontSize: 12 }} onClick={onEnd}>
-          New conversation
+        <button className="logout-btn" onClick={onLogout} title="Logout">Logout</button>
+        <button className="btn btn-ghost" style={{ color: "#94a3b8", fontSize: 12, marginLeft: 4 }} onClick={onEnd}>
+          New chat
         </button>
       </div>
 
@@ -868,7 +1111,8 @@ function StudentChat({ session, onToast, onEnd }) {
         )}
         {thread.map(msg => (
           <MsgBubble key={msg.id} msg={msg} isMine={msg.sender === "student"}
-            onReply={setReplyTo} allMsgs={thread} onScrollTo={scrollToMsg} />
+            onReply={setReplyTo} allMsgs={thread} onScrollTo={scrollToMsg}
+            onEdit={handleEdit} />
         ))}
         <div ref={endRef} />
       </div>
@@ -989,8 +1233,8 @@ function InboxLock({ onUnlock }) {
     <div className="lock-overlay">
       <div className="lock-card">
         <div className="lock-icon-ring"><Icons.Lock /></div>
-        <div className="lock-title">Mentor Inbox</div>
-        <div className="lock-sub">This area is private. Enter your password to view student messages.</div>
+        <div className="lock-title">Teacher's Inbox</div>
+        <div className="lock-sub">This area is private — only the teacher can access this. Enter your password to view student messages.</div>
         <div className="lock-input-wrap">
           <input ref={ref} className={`lock-input${shake ? " shake" : ""}`}
             type={show ? "text" : "password"} placeholder="Enter password"
@@ -1031,16 +1275,42 @@ function MentorInbox({ onToast }) {
   const fileRef = useRef(null);
   const endRef  = useRef(null);
 
+  const [prevMsgCount, setPrevMsgCount] = useState(0);
+
   const loadMessages = useCallback(async () => {
     try {
       const data = await fetchMessages();
+      // Notify mentor of new student messages
+      if (prevMsgCount > 0 && data.length > prevMsgCount) {
+        const newest = data[0]; // newest is first (desc order)
+        showLocalNotif(
+          `New message from ${newest.student_name || "a student"} 📬`,
+          newest.message || "New message received",
+          "student-msg"
+        );
+      }
+      setPrevMsgCount(data.length);
       setMessages(data);
       if (!activeId && data.length) setActiveId(data[0].id);
     } catch { onToast("Could not load messages", "error"); }
     finally { setLoading(false); }
-  }, [activeId, onToast]);
+  }, [activeId, onToast, prevMsgCount]);
 
   useEffect(() => { loadMessages(); }, []);
+
+  // Register SW so mentor gets notified even when inbox tab is closed
+  useEffect(() => {
+    (async () => {
+      await registerSW();
+      await requestNotifPermission();
+      updateSWState({
+        role: "mentor",
+        supabaseUrl: SUPABASE_URL,
+        anonKey: SUPABASE_ANON_KEY,
+        lastStudentMsgAt: null,
+      });
+    })();
+  }, []);
 
   useEffect(() => {
     if (!activeId) return;
@@ -1049,12 +1319,29 @@ function MentorInbox({ onToast }) {
     fetchThread(activeId).then(setThread).catch(() => {});
   }, [activeId]);
 
+  const [prevThreadLen, setPrevThreadLen] = useState(0);
+
   // Poll every 5s for student follow-up messages
   useEffect(() => {
     if (!activeId) return;
-    const id = setInterval(() => fetchThread(activeId).then(setThread).catch(() => {}), 5000);
+    const id = setInterval(async () => {
+      const data = await fetchThread(activeId).catch(() => null);
+      if (!data) return;
+      if (prevThreadLen > 0 && data.length > prevThreadLen) {
+        const newest = data[data.length - 1];
+        if (newest.sender === "student") {
+          showLocalNotif(
+            `${newest.sender_label || "Student"} sent a message 💬`,
+            newest.text || "Voice/file message",
+            "student-thread"
+          );
+        }
+      }
+      setPrevThreadLen(data.length);
+      setThread(data);
+    }, 5000);
     return () => clearInterval(id);
-  }, [activeId]);
+  }, [activeId, prevThreadLen]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -1070,6 +1357,15 @@ function MentorInbox({ onToast }) {
     el.style.animation = "msgHighlight 1.5s ease forwards";
     el.style.borderRadius = "10px";
   }, []);
+
+  // Edit mentor's own messages within 10 min
+  const handleEdit = useCallback(async (id, newText) => {
+    try {
+      await editThreadMsg(id, newText);
+      setThread(p => p.map(m => m.id === id ? { ...m, text: newText, edited: true } : m));
+      onToast("Message edited ✅", "success");
+    } catch { onToast("Edit failed", "error"); }
+  }, [onToast]);
 
   const sendReply = async () => {
     const hasText = reply.trim().length > 0;
@@ -1310,7 +1606,8 @@ function MentorInbox({ onToast }) {
                     </div>
                   : thread.map(msg => (
                       <MsgBubble key={msg.id} msg={msg} isMine={msg.sender === "mentor"}
-                        onReply={setReplyTo} allMsgs={thread} onScrollTo={scrollToMsg} />
+                        onReply={setReplyTo} allMsgs={thread} onScrollTo={scrollToMsg}
+                        onEdit={handleEdit} />
                     ))
                 }
                 <div ref={endRef} />
@@ -1466,9 +1763,14 @@ export default function CAFinalPortal() {
                 Student view
               </button>
               <button className={`tab-btn${tab === "mentor" ? " active" : ""}`} onClick={() => setTab("mentor")}>
-                {unlocked ? <Icons.Inbox /> : <Icons.Lock />} Your inbox
+                {unlocked ? <Icons.Inbox /> : <Icons.Lock />} Teacher's Inbox
               </button>
             </div>
+            {tab === "mentor" && !unlocked && (
+              <div style={{ marginTop: 8, fontSize: 12, color: "var(--ink3)", display: "flex", alignItems: "center", gap: 6 }}>
+                <Icons.Lock /> <span>This section is <strong>only accessible to the teacher</strong>. Students cannot view or access this tab.</span>
+              </div>
+            )}
           </div>
 
           {tab === "student" && <StudentPortal onToast={showToast} />}
@@ -1476,7 +1778,7 @@ export default function CAFinalPortal() {
             unlocked
               ? <>
                   <div className="unlock-banner">
-                    <div className="unlock-banner-left"><Icons.Shield /> Inbox unlocked — only visible to you</div>
+                    <div className="unlock-banner-left"><Icons.Shield /> Teacher's Inbox unlocked — students cannot see this section</div>
                     <button className="btn btn-ghost" style={{ color: "#94a3b8", fontSize: 13, padding: "4px 10px" }} onClick={lock}>
                       <Icons.LogOut /> Lock inbox
                     </button>
