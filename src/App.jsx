@@ -25,7 +25,9 @@ const fetchMessages = () => sbFetch("/messages?select=*&order=created_at.desc");
 const fetchThread   = (mid) => sbFetch(`/thread_messages?message_id=eq.${mid}&select=*&order=created_at.asc`);
 const insertMessage = (p) => sbFetch("/messages", { method: "POST", body: JSON.stringify(p) }).then(r => r[0]);
 const insertThread  = (p) => sbFetch("/thread_messages", { method: "POST", body: JSON.stringify(p) }).then(r => r[0]);
-const markReplied   = (id) => sbFetch(`/messages?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "Replied" }) });
+const markReplied     = (id) => sbFetch(`/messages?id=eq.${id}`, { method: "PATCH", body: JSON.stringify({ status: "Replied" }) });
+const deleteMessage   = (id) => sbFetch(`/messages?id=eq.${id}`, { method: "DELETE" });
+const deleteThread    = (mid) => sbFetch(`/thread_messages?message_id=eq.${mid}`, { method: "DELETE" });
 
 async function uploadAudio(blob, filename) {
   const res = await fetch(`${SUPABASE_URL}/storage/v1/object/audio-notes/${filename}`, {
@@ -38,6 +40,20 @@ async function uploadAudio(blob, filename) {
     body: blob,
   });
   if (!res.ok) throw new Error("Audio upload failed");
+  return `${SUPABASE_URL}/storage/v1/object/public/audio-notes/${filename}`;
+}
+
+async function uploadFile(file, filename) {
+  const res = await fetch(`${SUPABASE_URL}/storage/v1/object/audio-notes/${filename}`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      "Content-Type": file.type || "application/octet-stream",
+    },
+    body: file,
+  });
+  if (!res.ok) throw new Error("File upload failed");
   return `${SUPABASE_URL}/storage/v1/object/public/audio-notes/${filename}`;
 }
 
@@ -405,6 +421,28 @@ function StudentForm({ onToast, onSession }) {
         try { audioUrl = await uploadAudio(audioAtt.file, audioAtt.name); } catch (e) { console.warn("Audio upload failed:", e); }
       }
 
+      // Upload image to Supabase Storage
+      let imageUrl = null;
+      const imageAtt = atts.find(a => a.kind === "image");
+      if (imageAtt) {
+        try {
+          const ext = imageAtt.name.split(".").pop();
+          const fname = `img-${Date.now()}.${ext}`;
+          imageUrl = await uploadFile(imageAtt.file, fname);
+        } catch (e) { console.warn("Image upload failed:", e); }
+      }
+
+      // Upload other file to Supabase Storage
+      let fileUrl = null;
+      const fileAtt = atts.find(a => a.kind === "file");
+      if (fileAtt) {
+        try {
+          const ext = fileAtt.name.split(".").pop();
+          const fname = `file-${Date.now()}.${ext}`;
+          fileUrl = await uploadFile(fileAtt.file, fname);
+        } catch (e) { console.warn("File upload failed:", e); }
+      }
+
       // Save first thread message
       await insertThread({
         message_id: row.id,
@@ -412,8 +450,8 @@ function StudentForm({ onToast, onSession }) {
         sender_label: name.trim() || "Anonymous Student",
         text: hasText ? message.trim() : null,
         audio_url: audioUrl,
-        image_url: null,
-        file_url: null,
+        image_url: imageUrl,
+        file_url: fileUrl,
       });
 
       onToast("Message sent!", "success");
@@ -594,15 +632,17 @@ function StudentChat({ session, onToast, onEnd }) {
     if (!file) return;
     if (file.size > MAX_FILE_MB * 1024 * 1024) { onToast(`Max ${MAX_FILE_MB} MB`, "error"); return; }
     setSending(true);
-    const url = URL.createObjectURL(file);
-    const isImg = file.type.startsWith("image/");
     try {
+      const isImg = file.type.startsWith("image/");
+      const ext = file.name.split(".").pop();
+      const fname = `file-${Date.now()}.${ext}`;
+      const uploadedUrl = await uploadFile(file, fname);
       const row = await insertThread({
         message_id: session.messageId, sender: "student",
         sender_label: session.studentName,
-        text: `Shared file: ${file.name}`,
-        image_url: isImg ? url : null,
-        file_url: !isImg ? url : null,
+        text: null,
+        image_url: isImg ? uploadedUrl : null,
+        file_url: !isImg ? uploadedUrl : null,
         audio_url: null,
       });
       setThread(p => [...p, row]); onToast("File sent!", "success");
@@ -752,9 +792,11 @@ function MentorInbox({ onToast }) {
   const [thread, setThread]     = useState([]);
   const [reply, setReply]       = useState("");
   const [search, setSearch]     = useState("");
+  const [filter, setFilter]     = useState("all"); // "all" | "unread"
   const [loading, setLoading]   = useState(true);
   const [sending, setSending]   = useState(false);
   const [isRec, setIsRec]       = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(null); // id of convo to delete
   const recRef  = useRef(null);
   const chunks  = useRef([]);
   const fileRef = useRef(null);
@@ -833,10 +875,23 @@ function MentorInbox({ onToast }) {
 
   const stopRec = () => { recRef.current?.stop(); recRef.current = null; setIsRec(false); };
 
+  const deleteConvo = async (id) => {
+    try {
+      await deleteThread(id);
+      await deleteMessage(id);
+      setMessages(p => p.filter(m => m.id !== id));
+      if (activeId === id) { setActiveId(null); setThread([]); }
+      setConfirmDelete(null);
+      onToast("Conversation deleted", "success");
+    } catch { onToast("Failed to delete", "error"); }
+  };
+
   const filtered = messages.filter(m => {
     const q = search.toLowerCase();
-    return !q || [m.student_name, m.topic, m.attempt, m.message, m.mode]
+    const matchSearch = !q || [m.student_name, m.topic, m.attempt, m.message, m.mode]
       .some(v => String(v || "").toLowerCase().includes(q));
+    const matchFilter = filter === "all" || m.status === "Unread";
+    return matchSearch && matchFilter;
   });
 
   const active = messages.find(m => m.id === activeId);
@@ -852,42 +907,103 @@ function MentorInbox({ onToast }) {
             <span className="font-semibold" style={{ fontSize: 16 }}>Private Inbox</span>
             <span className="badge badge-blue" style={{ marginLeft: "auto" }}>{unread} unread</span>
           </div>
-          <div className="search-wrap" style={{ marginBottom: 12 }}>
+          <div className="search-wrap" style={{ marginBottom: 10 }}>
             <span className="search-icon"><Icons.Search /></span>
             <input className="input search-input" placeholder="Search…"
               value={search} onChange={e => setSearch(e.target.value)} />
           </div>
-          <div style={{ marginBottom: 12 }}>
+
+          {/* Filter tabs — All / Unread */}
+          <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+            <button onClick={() => setFilter("all")}
+              style={{ flex: 1, padding: "7px 0", borderRadius: 8, border: "1.5px solid", cursor: "pointer", fontSize: 12, fontWeight: 600, fontFamily: "inherit", transition: "all .15s",
+                background: filter === "all" ? "#0f172a" : "white",
+                color: filter === "all" ? "white" : "var(--ink2)",
+                borderColor: filter === "all" ? "#0f172a" : "var(--border)" }}>
+              All ({messages.length})
+            </button>
+            <button onClick={() => setFilter("unread")}
+              style={{ flex: 1, padding: "7px 0", borderRadius: 8, border: "1.5px solid", cursor: "pointer", fontSize: 12, fontWeight: 600, fontFamily: "inherit", transition: "all .15s",
+                background: filter === "unread" ? "var(--amber-bg)" : "white",
+                color: filter === "unread" ? "var(--amber)" : "var(--ink2)",
+                borderColor: filter === "unread" ? "var(--amber)" : "var(--border)" }}>
+              Unread ({unread})
+            </button>
+          </div>
+
+          <div style={{ marginBottom: 10 }}>
             <button className="btn btn-ghost" style={{ fontSize: 12, padding: "4px 8px" }} onClick={loadMessages}>
               <Icons.Refresh /> Refresh
             </button>
           </div>
+
           {loading
             ? <div className="empty">Loading…</div>
             : filtered.length === 0
-              ? <div className="empty">No messages yet.</div>
+              ? <div className="empty">{filter === "unread" ? "No unread messages 🎉" : "No messages yet."}</div>
               : <div className="convo-list">
                   {filtered.map(m => (
-                    <button key={m.id}
-                      className={`convo-item${activeId === m.id ? " active" : ""}`}
-                      onClick={() => setActiveId(m.id)}>
-                      <div className="convo-avatar">{(m.student_name || "A")[0].toUpperCase()}</div>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div className="convo-name">{m.student_name || "Anonymous"}</div>
-                        <div className="convo-sub">{m.message}</div>
-                        <div className="convo-meta">
-                          <span className="badge badge-gray">{m.attempt}</span>
-                          <span className="badge badge-gray">{m.topic}</span>
-                          <span className={`badge ${m.status === "Unread" ? "badge-amber" : "badge-green"}`}>
-                            {m.status}
-                          </span>
+                    <div key={m.id} style={{ position: "relative" }}>
+                      <button
+                        className={`convo-item${activeId === m.id ? " active" : ""}`}
+                        style={{ paddingRight: 40 }}
+                        onClick={() => setActiveId(m.id)}>
+                        <div className="convo-avatar">{(m.student_name || "A")[0].toUpperCase()}</div>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div className="convo-name">{m.student_name || "Anonymous"}</div>
+                          <div className="convo-sub">{m.message}</div>
+                          <div className="convo-meta">
+                            <span className="badge badge-gray">{m.attempt}</span>
+                            <span className="badge badge-gray">{m.topic}</span>
+                            <span className={`badge ${m.status === "Unread" ? "badge-amber" : "badge-green"}`}>
+                              {m.status}
+                            </span>
+                          </div>
                         </div>
-                      </div>
-                      <div className="convo-time">{timeLabel(m.created_at)}</div>
-                    </button>
+                        <div className="convo-time">{timeLabel(m.created_at)}</div>
+                      </button>
+                      {/* Delete button */}
+                      <button
+                        title="Delete conversation"
+                        onClick={e => { e.stopPropagation(); setConfirmDelete(m.id); }}
+                        style={{ position: "absolute", top: 10, right: 8, background: "none", border: "none",
+                          cursor: "pointer", color: "var(--ink3)", padding: 4, borderRadius: 6,
+                          display: "flex", alignItems: "center" }}
+                        onMouseEnter={e => e.currentTarget.style.color = "var(--red)"}
+                        onMouseLeave={e => e.currentTarget.style.color = "var(--ink3)"}>
+                        <Icons.Trash />
+                      </button>
+                    </div>
                   ))}
                 </div>
           }
+
+          {/* Delete confirmation popup */}
+          {confirmDelete && (
+            <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.4)", zIndex: 50,
+              display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <div style={{ background: "white", borderRadius: 16, padding: "32px 28px", maxWidth: 340,
+                width: "90%", textAlign: "center", boxShadow: "0 8px 32px rgba(0,0,0,.15)" }}>
+                <div style={{ width: 48, height: 48, background: "var(--red-bg)", borderRadius: "50%",
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  margin: "0 auto 16px", color: "var(--red)" }}>
+                  <Icons.Trash />
+                </div>
+                <div style={{ fontFamily: "'DM Serif Display',serif", fontSize: 20, marginBottom: 8 }}>
+                  Delete conversation?
+                </div>
+                <div style={{ fontSize: 13, color: "var(--ink2)", marginBottom: 24, lineHeight: 1.6 }}>
+                  This will permanently delete this student's conversation and all messages. This cannot be undone.
+                </div>
+                <div style={{ display: "flex", gap: 10 }}>
+                  <button className="btn btn-outline" style={{ flex: 1 }}
+                    onClick={() => setConfirmDelete(null)}>Cancel</button>
+                  <button className="btn btn-danger" style={{ flex: 1, background: "var(--red)", color: "white" }}
+                    onClick={() => deleteConvo(confirmDelete)}>Yes, delete</button>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
@@ -951,13 +1067,17 @@ function MentorInbox({ onToast }) {
                   style={{ display: "none" }} onChange={async (e) => {
                     const file = e.target.files?.[0];
                     if (!file || !activeId) return;
-                    const url = URL.createObjectURL(file);
-                    const isImg = file.type.startsWith("image/");
                     try {
+                      const isImg = file.type.startsWith("image/");
+                      const ext = file.name.split(".").pop();
+                      const fname = `mentor-file-${Date.now()}.${ext}`;
+                      const uploadedUrl = await uploadFile(file, fname);
                       const row = await insertThread({
                         message_id: activeId, sender: "mentor", sender_label: "Mentor",
-                        text: `Attached: ${file.name}`,
-                        image_url: isImg ? url : null, file_url: !isImg ? url : null, audio_url: null,
+                        text: null,
+                        image_url: isImg ? uploadedUrl : null,
+                        file_url: !isImg ? uploadedUrl : null,
+                        audio_url: null,
                       });
                       await markReplied(activeId); setThread(p => [...p, row]);
                       onToast("File sent!", "success");
@@ -1084,4 +1204,3 @@ export default function CAFinalPortal() {
     </>
   );
 }
-
