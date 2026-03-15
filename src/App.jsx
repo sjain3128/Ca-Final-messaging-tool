@@ -220,6 +220,7 @@ const css = `
 
   /* chat thread */
   .chat-thread { height:400px; overflow-y:auto; padding:16px 40px; background:var(--surface2); display:flex; flex-direction:column; gap:12px; }
+  @keyframes msgHighlight { 0%{background:rgba(59,130,246,.18)} 100%{background:transparent} }
   .msg-row { display:flex; flex-direction:column; }
   .msg-row.mine { align-items:flex-end; }
   .msg-row.theirs { align-items:flex-start; }
@@ -300,7 +301,7 @@ function Toast({ msg, type, onDone }) {
 }
 
 // ── Quote preview (shown inside bubble when replying to a message) ────────────
-function QuotePreview({ quoted, isMine }) {
+function QuotePreview({ quoted, isMine, onScrollTo }) {
   if (!quoted) return null;
   const label = quoted.sender === "mentor" ? "You" : (quoted.sender_label || "Student");
   const preview = quoted.text
@@ -310,14 +311,22 @@ function QuotePreview({ quoted, isMine }) {
     : quoted.file_url  ? "📄 File"
     : "Message";
   return (
-    <div style={{
-      borderLeft: `3px solid ${isMine ? "rgba(255,255,255,.5)" : "var(--accent2)"}`,
-      paddingLeft: 8, marginBottom: 6,
-      background: isMine ? "rgba(255,255,255,.1)" : "var(--surface3)",
-      borderRadius: "0 6px 6px 0", padding: "5px 8px",
-    }}>
+    <div
+      onClick={() => onScrollTo && onScrollTo(quoted.id)}
+      style={{
+        borderLeft: `3px solid ${isMine ? "rgba(255,255,255,.5)" : "var(--accent2)"}`,
+        marginBottom: 6,
+        background: isMine ? "rgba(255,255,255,.1)" : "var(--surface3)",
+        borderRadius: "0 6px 6px 0", padding: "5px 8px",
+        cursor: "pointer",
+        transition: "opacity .15s",
+      }}
+      onMouseEnter={e => e.currentTarget.style.opacity = ".75"}
+      onMouseLeave={e => e.currentTarget.style.opacity = "1"}
+      title="Click to jump to original message"
+    >
       <div style={{ fontSize: 11, fontWeight: 700, color: isMine ? "#93c5fd" : "var(--accent)", marginBottom: 2 }}>
-        {label}
+        ↑ {label}
       </div>
       <div style={{ fontSize: 12, opacity: .8, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
         {preview}
@@ -326,16 +335,28 @@ function QuotePreview({ quoted, isMine }) {
   );
 }
 
-// ── Message Bubble with swipe-to-reply ────────────────────────────────────────
-function MsgBubble({ msg, isMine, onReply, allMsgs }) {
+// ── Message Bubble with swipe-to-reply + scroll-to-original ──────────────────
+function MsgBubble({ msg, isMine, onReply, allMsgs, onScrollTo }) {
   const isPdf    = msg.file_url && msg.file_url.toLowerCase().includes(".pdf");
   const touchRef = useRef(null);
   const rowRef   = useRef(null);
-  const [swipeX, setSwipeX] = useState(0);
+  const [swipeX, setSwipeX]   = useState(0);
   const [swiping, setSwiping] = useState(false);
+  const [highlighted, setHighlighted] = useState(false);
+
+  // Each bubble gets a DOM id so it can be scrolled to
+  // id is set on the outer div as `msg-${msg.id}`
 
   // Find quoted message object
   const quoted = msg.reply_to_id ? allMsgs?.find(m => m.id === msg.reply_to_id) : null;
+
+  // Called by parent when another bubble's QuotePreview is clicked pointing here
+  useEffect(() => {
+    if (highlighted) {
+      const t = setTimeout(() => setHighlighted(false), 1500);
+      return () => clearTimeout(t);
+    }
+  }, [highlighted]);
 
   // ── Touch swipe (mobile) ──
   const onTouchStart = (e) => {
@@ -345,7 +366,6 @@ function MsgBubble({ msg, isMine, onReply, allMsgs }) {
   const onTouchMove = (e) => {
     if (!touchRef.current) return;
     const dx = e.touches[0].clientX - touchRef.current.x;
-    // swipe right on "theirs", swipe left on "mine" — both trigger reply
     const dir = isMine ? -1 : 1;
     const clamped = Math.max(0, Math.min(60, dx * dir));
     setSwipeX(clamped * dir);
@@ -355,18 +375,23 @@ function MsgBubble({ msg, isMine, onReply, allMsgs }) {
       onReply(msg);
     }
   };
-  const onTouchEnd = () => {
-    setSwipeX(0); setSwiping(false); touchRef.current = null;
-  };
+  const onTouchEnd = () => { setSwipeX(0); setSwiping(false); touchRef.current = null; };
 
-  // ── Mouse hover reply button (desktop) ──
   const [hovered, setHovered] = useState(false);
 
   return (
     <div
+      id={`msg-${msg.id}`}
       ref={rowRef}
       className={`msg-row ${isMine ? "mine" : "theirs"}`}
-      style={{ position: "relative", paddingLeft: isMine ? 0 : 36, paddingRight: isMine ? 36 : 0 }}
+      style={{
+        position: "relative",
+        paddingLeft: isMine ? 0 : 36,
+        paddingRight: isMine ? 36 : 0,
+        borderRadius: 10,
+        transition: "background .3s ease",
+        background: highlighted ? (isMine ? "rgba(59,130,246,.15)" : "rgba(59,130,246,.12)") : "transparent",
+      }}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       onTouchStart={onTouchStart}
@@ -375,25 +400,20 @@ function MsgBubble({ msg, isMine, onReply, allMsgs }) {
     >
       <div className="msg-sender">{isMine ? "You" : (msg.sender_label || "Student")}</div>
 
-      {/* Reply button — left side for "theirs", right side for "mine" */}
+      {/* Reply button */}
       <button
         onClick={() => onReply(msg)}
         title="Reply to this message"
         style={{
-          position: "absolute",
-          top: "50%",
-          transform: "translateY(-50%)",
+          position: "absolute", top: "50%", transform: "translateY(-50%)",
           ...(isMine ? { right: 0 } : { left: 0 }),
           background: hovered ? "var(--surface3)" : "transparent",
           border: hovered ? "1.5px solid var(--border)" : "1.5px solid transparent",
-          borderRadius: "50%",
-          width: 28, height: 28,
+          borderRadius: "50%", width: 28, height: 28,
           display: "flex", alignItems: "center", justifyContent: "center",
           cursor: "pointer",
           color: hovered ? "var(--accent2)" : "transparent",
-          transition: "all .15s",
-          zIndex: 2,
-          flexShrink: 0,
+          transition: "all .15s", zIndex: 2, flexShrink: 0,
         }}>
         <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor"
           strokeWidth={2.2} strokeLinecap="round" strokeLinejoin="round">
@@ -405,13 +425,12 @@ function MsgBubble({ msg, isMine, onReply, allMsgs }) {
 
       <div
         className={`bubble ${isMine ? "bubble-you" : "bubble-student"}`}
-        style={{
-          transform: `translateX(${swipeX}px)`,
-          transition: swiping ? "none" : "transform .2s ease",
-        }}
+        style={{ transform: `translateX(${swipeX}px)`, transition: swiping ? "none" : "transform .2s ease" }}
       >
-        {/* Quoted message preview */}
-        {quoted && <QuotePreview quoted={quoted} isMine={isMine} />}
+        {/* Quoted preview — clickable to scroll to original */}
+        {quoted && (
+          <QuotePreview quoted={quoted} isMine={isMine} onScrollTo={onScrollTo} />
+        )}
 
         {msg.text && <div>{msg.text}</div>}
         {msg.audio_url && (
@@ -731,6 +750,18 @@ function StudentChat({ session, onToast, onEnd }) {
   useEffect(() => { const id = setInterval(loadThread, 5000); return () => clearInterval(id); }, [loadThread]);
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [thread]);
 
+  // Scroll to original message and flash highlight
+  const scrollToMsg = useCallback((id) => {
+    const el = document.getElementById(`msg-${id}`);
+    if (!el) return;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    el.style.animation = "none";
+    // force reflow then apply highlight
+    void el.offsetWidth;
+    el.style.animation = "msgHighlight 1.5s ease forwards";
+    el.style.borderRadius = "10px";
+  }, []);
+
   // Stage file instead of uploading immediately
   const stageFile = (e) => {
     const file = e.target.files?.[0];
@@ -837,7 +868,7 @@ function StudentChat({ session, onToast, onEnd }) {
         )}
         {thread.map(msg => (
           <MsgBubble key={msg.id} msg={msg} isMine={msg.sender === "student"}
-            onReply={setReplyTo} allMsgs={thread} />
+            onReply={setReplyTo} allMsgs={thread} onScrollTo={scrollToMsg} />
         ))}
         <div ref={endRef} />
       </div>
@@ -1028,6 +1059,17 @@ function MentorInbox({ onToast }) {
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [thread]);
+
+  // Scroll to original message and flash highlight
+  const scrollToMsg = useCallback((id) => {
+    const el = document.getElementById(`msg-${id}`);
+    if (!el) return;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    el.style.animation = "none";
+    void el.offsetWidth;
+    el.style.animation = "msgHighlight 1.5s ease forwards";
+    el.style.borderRadius = "10px";
+  }, []);
 
   const sendReply = async () => {
     const hasText = reply.trim().length > 0;
@@ -1268,7 +1310,7 @@ function MentorInbox({ onToast }) {
                     </div>
                   : thread.map(msg => (
                       <MsgBubble key={msg.id} msg={msg} isMine={msg.sender === "mentor"}
-                        onReply={setReplyTo} allMsgs={thread} />
+                        onReply={setReplyTo} allMsgs={thread} onScrollTo={scrollToMsg} />
                     ))
                 }
                 <div ref={endRef} />
