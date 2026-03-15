@@ -80,7 +80,7 @@ const MAX_LOCK_TRIES   = 5;
 const LOCKOUT_MS       = 5 * 60 * 1000;
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
-const MAX_FILE_MB = 5;
+const MAX_FILE_MB = 50; // increased to 50 MB for PDFs and large files
 const STUDENT_SESSION_KEY = "ca-student-session";
 
 function timeLabel(iso) {
@@ -301,6 +301,7 @@ function Toast({ msg, type, onDone }) {
 
 // ── Message Bubble (shared) ───────────────────────────────────────────────────
 function MsgBubble({ msg, isMine }) {
+  const isPdf = msg.file_url && msg.file_url.toLowerCase().includes(".pdf");
   return (
     <div className={`msg-row ${isMine ? "mine" : "theirs"}`}>
       <div className="msg-sender">{isMine ? "You" : (msg.sender_label || "Student")}</div>
@@ -312,13 +313,24 @@ function MsgBubble({ msg, isMine }) {
         )}
         {msg.image_url && (
           <img src={msg.image_url} alt="attachment"
-            style={{ maxWidth: 200, borderRadius: 8, marginTop: msg.text ? 8 : 0, display: "block" }} />
+            style={{ maxWidth: 220, borderRadius: 8, marginTop: msg.text ? 8 : 0, display: "block" }} />
         )}
-        {msg.file_url && !msg.audio_url && !msg.image_url && (
-          <a href={msg.file_url} target="_blank" rel="noreferrer"
-            style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 6,
-              color: isMine ? "#93c5fd" : "var(--accent)", fontSize: 13 }}>
-            <Icons.File /> Download file
+        {msg.file_url && (
+          <a href={msg.file_url} target="_blank" rel="noreferrer" download
+            style={{
+              display: "flex", alignItems: "center", gap: 8, marginTop: msg.text ? 8 : 0,
+              background: isMine ? "rgba(255,255,255,.12)" : "var(--surface3)",
+              border: `1px solid ${isMine ? "rgba(255,255,255,.2)" : "var(--border)"}`,
+              borderRadius: 8, padding: "8px 12px", textDecoration: "none",
+              color: isMine ? "white" : "var(--accent)", fontSize: 13, fontWeight: 500,
+            }}>
+            <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+              strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+              <path d={isPdf
+                ? "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M9 13h6M9 17h6M9 9h1"
+                : "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"} />
+            </svg>
+            {isPdf ? "Download PDF" : "Download file"}
           </a>
         )}
         <div className="bubble-time">{timeLabel(msg.created_at)}</div>
@@ -547,10 +559,10 @@ function StudentForm({ onToast, onSession }) {
             {loading ? "Sending…" : "Send privately"}
           </button>
           <button className="btn btn-outline" onClick={() => fileRef.current?.click()}>
-            <Icons.Attach /> Attach file
+            <Icons.Attach /> Attach PDF / file
           </button>
           <input ref={fileRef} type="file" multiple
-            accept="image/*,.pdf,.doc,.docx,audio/*" style={{ display: "none" }} onChange={addFile} />
+            accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt" style={{ display: "none" }} onChange={addFile} />
         </div>
       </div>
     </div>
@@ -630,11 +642,15 @@ function StudentChat({ session, onToast, onEnd }) {
   const sendFile = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    if (file.size > MAX_FILE_MB * 1024 * 1024) { onToast(`Max ${MAX_FILE_MB} MB`, "error"); return; }
+    if (file.size > MAX_FILE_MB * 1024 * 1024) {
+      onToast(`File too large. Max ${MAX_FILE_MB} MB allowed.`, "error"); return;
+    }
     setSending(true);
+    onToast("Uploading file… please wait ⏳", "success");
     try {
       const isImg = file.type.startsWith("image/");
-      const ext = file.name.split(".").pop();
+      const isPdf = file.type === "application/pdf";
+      const ext   = file.name.split(".").pop();
       const fname = `file-${Date.now()}.${ext}`;
       const uploadedUrl = await uploadFile(file, fname);
       const row = await insertThread({
@@ -642,11 +658,12 @@ function StudentChat({ session, onToast, onEnd }) {
         sender_label: session.studentName,
         text: null,
         image_url: isImg ? uploadedUrl : null,
-        file_url: !isImg ? uploadedUrl : null,
+        file_url: (!isImg) ? uploadedUrl : null,
         audio_url: null,
       });
-      setThread(p => [...p, row]); onToast("File sent!", "success");
-    } catch { onToast("Failed to send file", "error"); }
+      setThread(p => [...p, row]);
+      onToast(isPdf ? "PDF sent! ✅" : "File sent! ✅", "success");
+    } catch { onToast("Upload failed. Try a smaller file.", "error"); }
     finally { setSending(false); e.target.value = ""; }
   };
 
@@ -698,8 +715,8 @@ function StudentChat({ session, onToast, onEnd }) {
             />
         }
         <button className="btn btn-ghost" style={{ padding: 8, flexShrink: 0 }}
-          onClick={() => fileRef.current?.click()} title="Attach file"><Icons.Attach /></button>
-        <input ref={fileRef} type="file" accept="image/*,.pdf,.doc,.docx"
+          onClick={() => fileRef.current?.click()} title="Attach PDF or file"><Icons.Attach /></button>
+        <input ref={fileRef} type="file" accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt"
           style={{ display: "none" }} onChange={sendFile} />
         {!isRec && (
           <button className="send-btn" onClick={sendText} disabled={sending || !text.trim()}>
@@ -1063,10 +1080,14 @@ function MentorInbox({ onToast }) {
                 }
                 <button className="btn btn-ghost" style={{ padding: 8, flexShrink: 0 }}
                   onClick={() => fileRef.current?.click()} title="Attach file"><Icons.Attach /></button>
-                <input ref={fileRef} type="file" accept="image/*,.pdf,.doc,.docx"
+                <input ref={fileRef} type="file" accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt"
                   style={{ display: "none" }} onChange={async (e) => {
                     const file = e.target.files?.[0];
                     if (!file || !activeId) return;
+                    if (file.size > MAX_FILE_MB * 1024 * 1024) {
+                      onToast(`File too large. Max ${MAX_FILE_MB} MB.`, "error"); return;
+                    }
+                    onToast("Uploading… please wait ⏳", "success");
                     try {
                       const isImg = file.type.startsWith("image/");
                       const ext = file.name.split(".").pop();
@@ -1080,8 +1101,8 @@ function MentorInbox({ onToast }) {
                         audio_url: null,
                       });
                       await markReplied(activeId); setThread(p => [...p, row]);
-                      onToast("File sent!", "success");
-                    } catch { onToast("Failed to send file", "error"); }
+                      onToast("File sent! ✅", "success");
+                    } catch { onToast("Upload failed. Try a smaller file.", "error"); }
                     e.target.value = "";
                   }} />
                 {!isRec && (
